@@ -1,0 +1,4 @@
+.env
+data/
+*.tunnelpane-part.*
+.DS_Store

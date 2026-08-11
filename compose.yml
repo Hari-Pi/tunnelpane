@@ -1,0 +1,32 @@
+services:
+  tunnelpane:
+    build:
+      context: .
+    image: tunnelpane:latest
+    container_name: tunnelpane
+    environment:
+      AUTH_USER: ${AUTH_USER}
+      AUTH_PASSWORD_HASH: ${AUTH_PASSWORD_HASH}
+      PUBLIC_URL: ${PUBLIC_URL}
+      DATA_DIR: /data
+      MAX_SINGLE_UPLOAD: 99614720
+      MAX_CHUNK_SIZE: 16777216
+      PORT: 3000
+    ports:
+      - "${LISTEN_ADDRESS:-127.0.0.1}:${LISTEN_PORT:-3000}:3000"
+    volumes:
+      - "${DATA_PATH:-./data}:/data"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

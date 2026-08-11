@@ -1,0 +1,14 @@
+{
+  "name": "tunnelpane",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A self-hosted HTTPS file drop with browser and two-pane terminal clients.",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}
