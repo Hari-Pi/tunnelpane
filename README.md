@@ -10,6 +10,8 @@ The service listens on loopback by default. It does not expose SSH or require in
 - Resumable chunked browser uploads
 - Two-pane local/server terminal interface
 - Hosted zsh and PowerShell launchers with no embedded credentials
+- Parallel chunked uploads and range downloads with configurable worker count
+- Live transfer progress with percentage, verified bytes, throughput, and active workers
 - Cancellable transfers and confirmation before file operations
 - HTTP range requests for resumable downloads
 - Basic authentication over HTTPS with only a SHA-256 password hash stored
@@ -66,6 +68,17 @@ irm https://files.example.com/client.ps1 | iex
 ```
 
 The clients ask for the username and a masked password. Neither credential is included in the public launcher.
+
+Transfers use four concurrent workers by default. Set `TUNNELPANE_TRANSFERS` to a value from 1 through 8 before launching a client to override it:
+
+```sh
+curl -fsSL https://files.example.com/client.zsh | TUNNELPANE_TRANSFERS=6 zsh
+```
+
+```powershell
+$env:TUNNELPANE_TRANSFERS = 6
+irm https://files.example.com/client.ps1 | iex
+```
 
 ### Keys
 

@@ -267,6 +267,18 @@ function cliFileIdFromPath(pathname) {
   return match ? match[1] : null;
 }
 
+function parallelUploadRoute(pathname) {
+  let match = pathname.match(/^\/api\/cli\/uploads\/([A-Za-z0-9_-]+)$/);
+  if (match) return { action: 'start', fileId: match[1] };
+  match = pathname.match(/^\/api\/cli\/uploads\/([a-f0-9-]{36})\/parts\/(\d+)$/);
+  if (match) return { action: 'part', sessionId: match[1], partIndex: Number(match[2]) };
+  match = pathname.match(/^\/api\/cli\/uploads\/([a-f0-9-]{36})\/(finish)$/);
+  if (match) return { action: 'finish', sessionId: match[1] };
+  match = pathname.match(/^\/api\/cli\/uploads\/([a-f0-9-]{36})$/);
+  if (match) return { action: 'session', sessionId: match[1] };
+  return null;
+}
+
 function uploadIdFromPath(pathname, suffix = '') {
   const pattern = suffix ? new RegExp('^/api/uploads/([a-f0-9-]{36})/' + suffix + '$') : /^\/api\/uploads\/([a-f0-9-]{36})$/;
   const match = pathname.match(pattern);
@@ -412,6 +424,102 @@ async function directUpload(req, res, name) {
   }
 }
 
+function parallelMetaPath(id) {
+  return path.join(UPLOAD_DIR, `.parallel-${id}.json`);
+}
+
+function parallelPartPath(id, index) {
+  return path.join(UPLOAD_DIR, `.parallel-${id}-${String(index).padStart(6, '0')}.part`);
+}
+
+async function readParallelUpload(id) {
+  try {
+    const metadata = JSON.parse(await fs.readFile(parallelMetaPath(id), 'utf8'));
+    return metadata;
+  } catch (error) {
+    if (error.code === 'ENOENT') throw Object.assign(new Error('Upload session not found'), { status: 404 });
+    throw error;
+  }
+}
+
+async function startParallelUpload(req, res, url, fileIdValue) {
+  const filename = filenameFromId(fileIdValue);
+  const size = Number(url.searchParams.get('size'));
+  const requestedPartSize = Number(url.searchParams.get('partSize') || 8 * 1024 * 1024);
+  if (!filename) return json(res, 400, { error: 'Invalid file ID' }, securityHeaders());
+  if (!Number.isSafeInteger(size) || size < 0) return json(res, 400, { error: 'Invalid file size' }, securityHeaders());
+  const minimumPartSize = Math.min(1024 * 1024, MAX_CHUNK_SIZE);
+  if (!Number.isSafeInteger(requestedPartSize) || requestedPartSize < minimumPartSize || requestedPartSize > MAX_CHUNK_SIZE) {
+    return json(res, 400, { error: 'Invalid part size' }, securityHeaders());
+  }
+  const partCount = Math.max(1, Math.ceil(size / requestedPartSize));
+  if (partCount > 10000) return json(res, 413, { error: 'Upload requires too many parts' }, securityHeaders());
+  const id = crypto.randomUUID();
+  const metadata = { id, filename, size, partSize: requestedPartSize, partCount, createdAt: Date.now() };
+  await fs.writeFile(parallelMetaPath(id), JSON.stringify(metadata), { flag: 'wx', mode: 0o600 });
+  if (url.searchParams.get('format') === 'tsv') {
+    const body = [id, requestedPartSize, partCount].join('\t') + '\n';
+    res.writeHead(201, { ...securityHeaders(), 'Content-Type': 'text/tab-separated-values; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
+    return res.end(body);
+  }
+  return json(res, 201, metadata, securityHeaders());
+}
+
+async function uploadParallelPart(req, res, id, index) {
+  const metadata = await readParallelUpload(id);
+  if (!Number.isSafeInteger(index) || index < 0 || index >= metadata.partCount) {
+    return json(res, 400, { error: 'Invalid part index' }, securityHeaders());
+  }
+  const expected = index === metadata.partCount - 1 ? metadata.size - index * metadata.partSize : metadata.partSize;
+  const contentLength = Number(req.headers['content-length']);
+  if (Number.isFinite(contentLength) && contentLength !== expected) {
+    return json(res, 400, { error: 'Part size does not match expected size', expected }, securityHeaders());
+  }
+  const temporary = path.join(UPLOAD_DIR, `${id}-${index}-${crypto.randomUUID()}.put`);
+  try {
+    const written = await writeRequest(req, temporary, 'wx', Math.max(1, expected));
+    if (written !== expected) return json(res, 400, { error: 'Part size does not match expected size', expected, written }, securityHeaders());
+    await fs.rename(temporary, parallelPartPath(id, index));
+    return json(res, 201, { ok: true, index, size: written }, securityHeaders());
+  } finally {
+    await fs.rm(temporary, { force: true });
+  }
+}
+
+async function removeParallelUpload(id, metadata) {
+  const upload = metadata || await readParallelUpload(id);
+  await Promise.all(Array.from({ length: upload.partCount }, (_, index) => fs.rm(parallelPartPath(id, index), { force: true })));
+  await fs.rm(parallelMetaPath(id), { force: true });
+}
+
+async function finishParallelUpload(res, id) {
+  const metadata = await readParallelUpload(id);
+  for (let index = 0; index < metadata.partCount; index++) {
+    let stat;
+    try { stat = await fs.stat(parallelPartPath(id, index)); } catch (error) {
+      if (error.code === 'ENOENT') return json(res, 409, { error: 'Upload is incomplete', missingPart: index }, securityHeaders());
+      throw error;
+    }
+    const expected = index === metadata.partCount - 1 ? metadata.size - index * metadata.partSize : metadata.partSize;
+    if (stat.size !== expected) return json(res, 409, { error: 'Upload part has an invalid size', part: index }, securityHeaders());
+  }
+
+  const temporary = path.join(UPLOAD_DIR, crypto.randomUUID() + '.assemble');
+  try {
+    await fs.writeFile(temporary, '', { flag: 'wx', mode: 0o600 });
+    for (let index = 0; index < metadata.partCount; index++) {
+      await fs.appendFile(temporary, await fs.readFile(parallelPartPath(id, index)));
+    }
+    const stat = await fs.stat(temporary);
+    if (stat.size !== metadata.size) throw Object.assign(new Error('Assembled upload size mismatch'), { status: 409 });
+    await fs.rename(temporary, path.join(DATA_DIR, metadata.filename));
+    await removeParallelUpload(id, metadata);
+    return json(res, 200, { ok: true, name: metadata.filename, size: metadata.size }, securityHeaders());
+  } finally {
+    await fs.rm(temporary, { force: true });
+  }
+}
+
 async function cleanupUploads() {
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
   for (const entry of await fs.readdir(UPLOAD_DIR, { withFileTypes: true })) {
@@ -447,6 +555,11 @@ async function handle(req, res) {
       res.writeHead(200, { ...securityHeaders(), 'Content-Type': 'text/tab-separated-values; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
       return res.end(body);
     }
+    if (url.searchParams.get('format') === 'tsv2') {
+      const body = files.map(file => [file.id, Buffer.from(file.name).toString('base64'), formatBytes(file.size), new Date(file.modified).toISOString(), file.size].join('\t')).join('\n') + (files.length ? '\n' : '');
+      res.writeHead(200, { ...securityHeaders(), 'Content-Type': 'text/tab-separated-values; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
+      return res.end(body);
+    }
     return json(res, 200, { files: files.map(file => ({ ...file, sizeLabel: formatBytes(file.size) })) }, securityHeaders());
   }
   if (req.method === 'GET' && url.pathname === '/api/status') {
@@ -460,6 +573,22 @@ async function handle(req, res) {
   if (req.method === 'PATCH' && uploadId) return appendUpload(req, res, uploadId);
   const finishId = uploadIdFromPath(url.pathname, 'finish');
   if (req.method === 'POST' && finishId) return finishUpload(res, finishId);
+
+  const parallelRoute = parallelUploadRoute(url.pathname);
+  if (parallelRoute) {
+    if (req.method === 'POST' && parallelRoute.action === 'start') return startParallelUpload(req, res, url, parallelRoute.fileId);
+    if (req.method === 'DELETE' && parallelRoute.action === 'start' && /^[a-f0-9-]{36}$/.test(parallelRoute.fileId)) {
+      await removeParallelUpload(parallelRoute.fileId);
+      return json(res, 200, { ok: true }, securityHeaders());
+    }
+    if (req.method === 'PUT' && parallelRoute.action === 'part') return uploadParallelPart(req, res, parallelRoute.sessionId, parallelRoute.partIndex);
+    if (req.method === 'POST' && parallelRoute.action === 'finish') return finishParallelUpload(res, parallelRoute.sessionId);
+    if (req.method === 'DELETE' && parallelRoute.action === 'session') {
+      await removeParallelUpload(parallelRoute.sessionId);
+      return json(res, 200, { ok: true }, securityHeaders());
+    }
+    return json(res, 405, { error: 'Method not allowed' }, securityHeaders());
+  }
 
   const cliId = cliFileIdFromPath(url.pathname);
   if (cliId) {
@@ -498,7 +627,7 @@ async function main() {
   setInterval(() => cleanupUploads().catch(error => console.error('upload cleanup failed', error)), 60 * 60 * 1000).unref();
   const server = http.createServer((req, res) => {
     handle(req, res).catch(error => {
-      console.error(req.method, req.url, error);
+      if (!error.status || error.status >= 500) console.error(req.method, req.url, error);
       if (!res.headersSent) json(res, error.status || 500, { error: error.status ? error.message : 'Internal server error' }, securityHeaders());
       else res.destroy();
     });

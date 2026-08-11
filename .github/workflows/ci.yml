@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+
+  zsh:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: zsh -n client.zsh
+
+  powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse PowerShell client
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD "client.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count) {
+            $errors | Format-List | Out-String | Write-Error
+            exit 1
+          }

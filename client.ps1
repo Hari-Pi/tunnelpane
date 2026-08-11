@@ -7,6 +7,10 @@ $ServerSelected = 0
 $LocalOffset = 0
 $ServerOffset = 0
 $Status = "Ready."
+$TransferWorkers = if ($env:TUNNELPANE_TRANSFERS) { [int]$env:TUNNELPANE_TRANSFERS } else { 4 }
+if ($TransferWorkers -lt 1) { $TransferWorkers = 4 }
+if ($TransferWorkers -gt 8) { $TransferWorkers = 8 }
+$TransferPartSize = 8MB
 
 function Get-FileId([string]$Name) {
     $value = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Name))
@@ -24,7 +28,7 @@ function Get-LocalItems {
     $items = @()
     $parent = Split-Path -Parent $LocalDirectory
     if ($parent -and $parent -ne $LocalDirectory) {
-        $items += [pscustomobject]@{ Name = ".."; FullName = $parent; IsDirectory = $true; SizeLabel = "-" }
+        $items += [pscustomobject]@{ Name = ".."; FullName = $parent; IsDirectory = $true; SizeLabel = "-"; Length = 0 }
     }
     try {
         $children = @(Get-ChildItem -LiteralPath $LocalDirectory -Force | Sort-Object @{ Expression = { -not $_.PSIsContainer } }, Name)
@@ -36,6 +40,7 @@ function Get-LocalItems {
                 FullName = $item.FullName
                 IsDirectory = [bool]$item.PSIsContainer
                 SizeLabel = if ($item.PSIsContainer) { "-" } else { Format-Size $item.Length }
+                Length = if ($item.PSIsContainer) { 0 } else { [long]$item.Length }
             }
         }
     } catch {
@@ -119,7 +124,7 @@ function Show-Panes {
     Write-Host "[Tab/Left/Right] Pane  [Up/Down or j/k] Select  [Enter] Open folder"
     Write-Host "[u] Upload selected  [d] Download selected  [x] Delete server file  [r] Refresh"
     Write-Host "[Esc/Ctrl+C] Cancel  [q] Quit"
-    Write-Host -NoNewline (Fit-Text "Status: $Status" ($width - 1))
+    Write-Host -NoNewline (Fit-Text "Workers: $TransferWorkers  |  Status: $Status" ($width - 1))
 }
 
 function Read-KeyName {
@@ -158,6 +163,31 @@ function Wait-CancellableTask($Task, [Threading.CancellationTokenSource]$Cancell
     return $true
 }
 
+function Test-CancelRequested {
+    if (-not [Console]::KeyAvailable) { return $false }
+    return (Read-KeyName) -eq "CANCEL"
+}
+
+function Show-TransferProgress([string]$Action, [string]$Name, [long]$Transferred, [long]$Total, [int]$Workers, [DateTime]$Started) {
+    $percent = if ($Total -gt 0) { [Math]::Min(100, [Math]::Floor($Transferred * 100 / $Total)) } else { 100 }
+    $elapsed = [Math]::Max(1, ([DateTime]::UtcNow - $Started).TotalSeconds)
+    $rate = [long]($Transferred / $elapsed)
+    $barWidth = 24
+    $filled = [int][Math]::Floor($percent * $barWidth / 100)
+    $bar = ("#" * $filled) + ("-" * ($barWidth - $filled))
+    $displayName = if ($Name.Length -gt 18) { $Name.Substring(0, 15) + "..." } else { $Name.PadRight(18) }
+    $line = "{0,-8} {1} [{2}] {3,3}%  {4}/{5}  {6}/s  {7} workers  Esc/Ctrl+C cancels" -f $Action, $displayName, $bar, $percent, (Format-Size $Transferred), (Format-Size $Total), (Format-Size $rate), $Workers
+    try { $width = [Math]::Max(64, [Console]::WindowWidth) } catch { $width = 80 }
+    Write-Host -NoNewline ("`r" + (Fit-Text $line ($width - 1)))
+}
+
+function Dispose-ActiveTransfers($Active) {
+    foreach ($record in @($Active)) {
+        try { $record.Request.Dispose() } catch {}
+        try { if ($record.Response) { $record.Response.Dispose() } } catch {}
+    }
+}
+
 function Upload-Selected {
     if ($ActivePane -ne "local" -or $LocalSelected -lt 0 -or $LocalItems[$LocalSelected].IsDirectory) {
         $script:Status = "Select a file in the local pane to upload."
@@ -166,28 +196,72 @@ function Upload-Selected {
     $item = $LocalItems[$LocalSelected]
     if ($item.Name.StartsWith(".")) { $script:Status = "Server filenames cannot begin with a dot."; return }
     if (-not (Confirm-Action "Upload `"$($item.Name)`"?")) { $script:Status = "Upload cancelled."; return }
-    $stream = $null
-    $content = $null
+    $session = $null
+    $active = [Collections.ArrayList]::new()
     $cancellation = [Threading.CancellationTokenSource]::new()
+    $finished = $false
     try {
-        $script:Status = "Uploading $($item.Name) - Esc or Ctrl+C cancels."
+        $id = Get-FileId $item.Name
+        $session = Invoke-RestMethod -Uri "$BaseUrl/api/cli/uploads/${id}?size=$($item.Length)&partSize=$TransferPartSize" -Headers $Headers -Method Post
+        $workers = [Math]::Min($TransferWorkers, [int]$session.partCount)
+        $nextPart = 0
+        [long]$completedBytes = 0
+        $started = [DateTime]::UtcNow
+        $script:Status = "Parallel upload: $workers workers."
         Show-Panes
-        $stream = [IO.File]::OpenRead($item.FullName)
-        $content = [Net.Http.StreamContent]::new($stream)
-        $task = $Http.PutAsync("$BaseUrl/api/cli/files/$(Get-FileId $item.Name)", $content, $cancellation.Token)
-        if (-not (Wait-CancellableTask $task $cancellation)) { $script:Status = "Upload cancelled."; return }
-        $response = $task.GetAwaiter().GetResult()
-        $response.EnsureSuccessStatusCode() | Out-Null
+        while ($nextPart -lt $session.partCount -or $active.Count -gt 0) {
+            while ($nextPart -lt $session.partCount -and $active.Count -lt $workers) {
+                [long]$offset = $nextPart * [long]$session.partSize
+                [int]$length = [int][Math]::Min([long]$session.partSize, [long]$item.Length - $offset)
+                $buffer = New-Object byte[] $length
+                $stream = [IO.File]::OpenRead($item.FullName)
+                try {
+                    [void]$stream.Seek($offset, [IO.SeekOrigin]::Begin)
+                    $read = 0
+                    while ($read -lt $length) {
+                        $count = $stream.Read($buffer, $read, $length - $read)
+                        if ($count -eq 0) { throw "Unexpected end of local file" }
+                        $read += $count
+                    }
+                } finally { $stream.Dispose() }
+                $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Put, "$BaseUrl/api/cli/uploads/$($session.id)/parts/$nextPart")
+                $request.Content = [Net.Http.ByteArrayContent]::new($buffer)
+                $task = $Http.SendAsync($request, $cancellation.Token)
+                [void]$active.Add([pscustomobject]@{ Task = $task; Request = $request; Response = $null; Length = $length; Index = $nextPart })
+                $nextPart++
+            }
+            for ($index = $active.Count - 1; $index -ge 0; $index--) {
+                $record = $active[$index]
+                if (-not $record.Task.IsCompleted) { continue }
+                $response = $record.Task.GetAwaiter().GetResult()
+                $record.Response = $response
+                $response.EnsureSuccessStatusCode() | Out-Null
+                $completedBytes += $record.Length
+                $response.Dispose(); $request = $record.Request; $request.Dispose()
+                $active.RemoveAt($index)
+            }
+            Show-TransferProgress "UPLOAD" $item.Name $completedBytes $item.Length $workers $started
+            if (Test-CancelRequested) { $cancellation.Cancel(); throw [OperationCanceledException]::new() }
+            if ($active.Count -gt 0) { Start-Sleep -Milliseconds 80 }
+        }
+        Write-Host ""
+        Invoke-RestMethod -Uri "$BaseUrl/api/cli/uploads/$($session.id)/finish" -Headers $Headers -Method Post | Out-Null
+        $finished = $true
         $script:ServerItems = @(Get-ServerItems)
         Clamp-Selections
-        $script:Status = "Uploaded $($item.Name)."
+        $script:Status = "Uploaded $($item.Name) with $workers workers."
     } catch [OperationCanceledException] {
+        Write-Host ""
         $script:Status = "Upload cancelled."
     } catch {
-        $script:Status = "Upload failed. Files above 95 MB must use the browser."
+        Write-Host ""
+        $script:Status = "Parallel upload failed: $($_.Exception.Message)"
     } finally {
-        if ($content) { $content.Dispose() }
-        if ($stream) { $stream.Dispose() }
+        if (-not $cancellation.IsCancellationRequested) { $cancellation.Cancel() }
+        Dispose-ActiveTransfers $active
+        if ($session -and -not $finished) {
+            try { Invoke-RestMethod -Uri "$BaseUrl/api/cli/uploads/$($session.id)" -Headers $Headers -Method Delete | Out-Null } catch {}
+        }
         $cancellation.Dispose()
     }
 }
@@ -202,42 +276,78 @@ function Download-Selected {
     $prompt = if (Test-Path -LiteralPath $destination) { "Replace local `"$($item.name)`"?" } else { "Download `"$($item.name)`" here?" }
     if (-not (Confirm-Action $prompt)) { $script:Status = "Download cancelled."; return }
     $partial = "$destination.tunnelpane-part.$PID"
-    $output = $null
-    $input = $null
-    $response = $null
+    $stateDirectory = Join-Path ([IO.Path]::GetTempPath()) ("tunnelpane-download-" + [Guid]::NewGuid().ToString("N"))
+    [void][IO.Directory]::CreateDirectory($stateDirectory)
+    $active = [Collections.ArrayList]::new()
     $cancellation = [Threading.CancellationTokenSource]::new()
     try {
-        $script:Status = "Downloading $($item.name) - Esc or Ctrl+C cancels."
-        Show-Panes
-        $task = $Http.GetAsync("$BaseUrl/api/cli/files/$($item.id)", [Net.Http.HttpCompletionOption]::ResponseHeadersRead, $cancellation.Token)
-        if (-not (Wait-CancellableTask $task $cancellation)) { $script:Status = "Download cancelled."; return }
-        $response = $task.GetAwaiter().GetResult()
-        $response.EnsureSuccessStatusCode() | Out-Null
-        $input = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
-        $output = [IO.File]::Open($partial, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        $buffer = New-Object byte[] 65536
-        while ($true) {
-            $readTask = $input.ReadAsync($buffer, 0, $buffer.Length, $cancellation.Token)
-            if (-not (Wait-CancellableTask $readTask $cancellation)) { $script:Status = "Download cancelled."; return }
-            $count = $readTask.GetAwaiter().GetResult()
-            if ($count -eq 0) { break }
-            $output.Write($buffer, 0, $count)
+        [long]$total = $item.size
+        if ($total -eq 0) {
+            [IO.File]::WriteAllBytes($partial, (New-Object byte[] 0))
+            Move-Item -LiteralPath $partial -Destination $destination -Force
+            $script:LocalItems = @(Get-LocalItems); Clamp-Selections
+            $script:Status = "Downloaded empty file $($item.name)."
+            return
         }
-        $output.Dispose(); $output = $null
+        $partCount = [int][Math]::Ceiling($total / $TransferPartSize)
+        $workers = [Math]::Min($TransferWorkers, $partCount)
+        $nextPart = 0
+        [long]$completedBytes = 0
+        $started = [DateTime]::UtcNow
+        $script:Status = "Parallel download: $workers workers."
+        Show-Panes
+        while ($nextPart -lt $partCount -or $active.Count -gt 0) {
+            while ($nextPart -lt $partCount -and $active.Count -lt $workers) {
+                [long]$start = $nextPart * [long]$TransferPartSize
+                [long]$end = [Math]::Min($total - 1, $start + $TransferPartSize - 1)
+                $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, "$BaseUrl/api/cli/files/$($item.id)")
+                $request.Headers.Range = [Net.Http.Headers.RangeHeaderValue]::Parse("bytes=$start-$end")
+                $task = $Http.SendAsync($request, $cancellation.Token)
+                [void]$active.Add([pscustomobject]@{ Task = $task; Request = $request; Response = $null; Length = [int]($end - $start + 1); Index = $nextPart })
+                $nextPart++
+            }
+            for ($index = $active.Count - 1; $index -ge 0; $index--) {
+                $record = $active[$index]
+                if (-not $record.Task.IsCompleted) { continue }
+                $response = $record.Task.GetAwaiter().GetResult()
+                $record.Response = $response
+                $response.EnsureSuccessStatusCode() | Out-Null
+                $bytes = $response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult()
+                if ($bytes.Length -ne $record.Length) { throw "Downloaded part has an invalid size" }
+                [IO.File]::WriteAllBytes((Join-Path $stateDirectory "part.$($record.Index)"), $bytes)
+                $completedBytes += $bytes.Length
+                $response.Dispose(); $request = $record.Request; $request.Dispose()
+                $active.RemoveAt($index)
+            }
+            Show-TransferProgress "DOWNLOAD" $item.name $completedBytes $total $workers $started
+            if (Test-CancelRequested) { $cancellation.Cancel(); throw [OperationCanceledException]::new() }
+            if ($active.Count -gt 0) { Start-Sleep -Milliseconds 80 }
+        }
+        Write-Host ""
+        $output = [IO.File]::Open($partial, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            for ($part = 0; $part -lt $partCount; $part++) {
+                $input = [IO.File]::OpenRead((Join-Path $stateDirectory "part.$part"))
+                try { $input.CopyTo($output) } finally { $input.Dispose() }
+            }
+        } finally { $output.Dispose() }
+        if ((Get-Item -LiteralPath $partial).Length -ne $total) { throw "Download verification failed" }
         Move-Item -LiteralPath $partial -Destination $destination -Force
         $script:LocalItems = @(Get-LocalItems)
         Clamp-Selections
-        $script:Status = "Downloaded $($item.name)."
+        $script:Status = "Downloaded $($item.name) with $workers workers."
     } catch [OperationCanceledException] {
+        Write-Host ""
         $script:Status = "Download cancelled."
     } catch {
-        $script:Status = "Download failed: $($_.Exception.Message)"
+        Write-Host ""
+        $script:Status = "Parallel download failed: $($_.Exception.Message)"
     } finally {
-        if ($output) { $output.Dispose() }
-        if ($input) { $input.Dispose() }
-        if ($response) { $response.Dispose() }
+        if (-not $cancellation.IsCancellationRequested) { $cancellation.Cancel() }
+        Dispose-ActiveTransfers $active
         $cancellation.Dispose()
         if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force }
+        if (Test-Path -LiteralPath $stateDirectory) { Remove-Item -LiteralPath $stateDirectory -Recurse -Force }
     }
 }
 

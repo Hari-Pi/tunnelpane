@@ -32,11 +32,14 @@ try {
   assert.doesNotMatch(powershellClient, /__TUNNELPANE_URL__/);
   assert.match(zshClient, /printf 'Username: '/);
   assert.match(zshClient, /Tab\/Left\/Right/);
-  assert.match(zshClient, /run_cancellable/);
+  assert.match(zshClient, /monitor_workers/);
+  assert.match(zshClient, /format=tsv2/);
   assert.match(powershellClient, /Read-Host "Password" -AsSecureString/);
   assert.match(powershellClient, /Read-Host "Username"/);
   assert.match(powershellClient, /TreatControlCAsInput/);
   assert.match(powershellClient, /Wait-CancellableTask/);
+  assert.match(powershellClient, /Show-TransferProgress/);
+  assert.match(powershellClient, /api\/cli\/uploads/);
 
   let response = await fetch(base + '/hello.txt', { method: 'PUT', headers: { Authorization: auth }, body: 'hello world' });
   assert.equal(response.status, 201);
@@ -70,8 +73,36 @@ try {
   response = await fetch(base + '/api/cli/files?format=tsv', { headers: { Authorization: auth } });
   const tsv = await response.text();
   assert.match(tsv, new RegExp('^' + cliId + '\\t' + Buffer.from(cliName).toString('base64') + '\\t', 'm'));
+  response = await fetch(base + '/api/cli/files?format=tsv2', { headers: { Authorization: auth } });
+  const tsv2 = await response.text();
+  assert.match(tsv2, new RegExp('^' + cliId + '\\t.*\\t12$', 'm'));
   response = await fetch(base + '/api/cli/files/' + cliId, { method: 'DELETE', headers: { Authorization: auth } });
   assert.equal(response.status, 200);
+
+  const parallelName = 'parallel upload.bin';
+  const parallelId = Buffer.from(parallelName).toString('base64url');
+  response = await fetch(base + `/api/cli/uploads/${parallelId}?size=20&partSize=8`, { method: 'POST', headers: { Authorization: auth } });
+  const parallel = await response.json();
+  assert.equal(response.status, 201);
+  assert.equal(parallel.partCount, 3);
+  for (const [index, body] of [[2, 'qrst'], [0, 'abcdefgh'], [1, 'ijklmnop']]) {
+    response = await fetch(base + `/api/cli/uploads/${parallel.id}/parts/${index}`, { method: 'PUT', headers: { Authorization: auth }, body });
+    assert.equal(response.status, 201);
+  }
+  response = await fetch(base + `/api/cli/uploads/${parallel.id}/finish`, { method: 'POST', headers: { Authorization: auth } });
+  assert.equal(response.status, 200);
+  assert.equal(await fs.readFile(path.join(dataDir, parallelName), 'utf8'), 'abcdefghijklmnopqrst');
+
+  const cancelledName = 'cancelled.bin';
+  const cancelledId = Buffer.from(cancelledName).toString('base64url');
+  response = await fetch(base + `/api/cli/uploads/${cancelledId}?size=8&partSize=8`, { method: 'POST', headers: { Authorization: auth } });
+  const cancelled = await response.json();
+  response = await fetch(base + `/api/cli/uploads/${cancelled.id}/parts/0`, { method: 'PUT', headers: { Authorization: auth }, body: '12345678' });
+  assert.equal(response.status, 201);
+  response = await fetch(base + `/api/cli/uploads/${cancelled.id}`, { method: 'DELETE', headers: { Authorization: auth } });
+  assert.equal(response.status, 200);
+  response = await fetch(base + `/api/cli/uploads/${cancelled.id}/finish`, { method: 'POST', headers: { Authorization: auth } });
+  assert.equal(response.status, 404);
 
   response = await fetch(base + '/hello.txt', { method: 'DELETE', headers: { Authorization: auth } });
   assert.equal(response.status, 200);
