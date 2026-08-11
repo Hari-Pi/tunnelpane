@@ -4,6 +4,12 @@ TunnelPane is a small self-hosted file service designed to sit behind an HTTPS r
 
 The service listens on loopback by default. It does not expose SSH or require inbound router port forwarding.
 
+## Demo
+
+[![TunnelPane terminal client demo](docs/tunnelpane-preview.gif)](https://github.com/Hari-Pi/tunnelpane/raw/refs/heads/main/docs/tunnelpane-demo.mp4)
+
+[Watch the full terminal demo](https://github.com/Hari-Pi/tunnelpane/raw/refs/heads/main/docs/tunnelpane-demo.mp4) showing pane navigation, parallel transfers, recursive folder upload, and server-folder browsing.
+
 ## Features
 
 - Browser folder navigation, creation, upload, download, search, sorting, and deletion
