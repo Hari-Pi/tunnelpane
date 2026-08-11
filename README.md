@@ -8,10 +8,10 @@ The service listens on loopback by default. It does not expose SSH or require in
 
 - Browser upload, download, search, sorting, and deletion
 - Resumable chunked browser uploads
-- Two-pane local/server terminal interface
+- Responsive full-screen terminal interface with color-coded panes and aligned file metadata
 - Hosted zsh and PowerShell launchers with no embedded credentials
 - Parallel chunked uploads and range downloads with configurable worker count
-- Live transfer progress with percentage, verified bytes, throughput, and active workers
+- Responsive transfer progress with percentage, verified bytes, throughput, active workers, and persistent cancel hints
 - Cancellable transfers and confirmation before file operations
 - HTTP range requests for resumable downloads
 - Basic authentication over HTTPS with only a SHA-256 password hash stored

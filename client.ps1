@@ -88,43 +88,121 @@ function Adjust-Offsets([int]$Rows) {
     }
 }
 
+function New-TitleBorder([string]$Title, [int]$Width) {
+    $label = "+-- $Title "
+    return $label + ("-" * [Math]::Max(0, $Width - $label.Length - 1)) + "+"
+}
+
+function New-ItemRow([string]$Name, [string]$Size, [string]$Modified, [int]$Width, [string]$Marker, [bool]$ShowDate) {
+    if ($ShowDate) {
+        $nameWidth = [Math]::Max(8, $Width - 31)
+        $display = Fit-Text $Name $nameWidth
+        $value = "{0} {1} {2,9}  {3,-16} " -f $Marker, $display, $Size, $Modified
+    } else {
+        $nameWidth = [Math]::Max(8, $Width - 14)
+        $display = Fit-Text $Name $nameWidth
+        $value = "{0} {1} {2,9} " -f $Marker, $display, $Size
+    }
+    return Fit-Text $value $Width
+}
+
+function Write-Key([string]$Key) {
+    Write-Host -NoNewline ($Key.PadRight(5)) -ForegroundColor Cyan
+}
+
+function Write-PaneRow([string]$Row, [bool]$Selected, [bool]$Active, [bool]$Directory, [ConsoleColor]$Accent) {
+    Write-Host -NoNewline "|" -ForegroundColor $Accent
+    if ($Selected -and $Active) {
+        $background = if ($Accent -eq [ConsoleColor]::Cyan) { [ConsoleColor]::Cyan } else { [ConsoleColor]::Yellow }
+        Write-Host -NoNewline $Row -ForegroundColor Black -BackgroundColor $background
+    } elseif ($Selected) {
+        Write-Host -NoNewline $Row -ForegroundColor White
+    } elseif ($Directory) {
+        Write-Host -NoNewline $Row -ForegroundColor Cyan
+    } else {
+        Write-Host -NoNewline $Row
+    }
+    Write-Host -NoNewline "|" -ForegroundColor $Accent
+}
+
 function Show-Panes {
-    try { $width = [Math]::Max(64, [Console]::WindowWidth); $height = [Math]::Max(20, [Console]::WindowHeight) }
+    try { $width = [Console]::WindowWidth - 1; $height = [Console]::WindowHeight }
     catch { $width = 80; $height = 24 }
-    $paneWidth = [Math]::Floor(($width - 1) / 2)
+    if ($width -lt 72 -or $height -lt 16) {
+        [Console]::Clear()
+        Write-Host "TunnelPane needs at least 72 columns and 16 rows." -ForegroundColor Yellow
+        return
+    }
+    $gap = 2
+    $paneWidth = [Math]::Floor(($width - $gap) / 2)
     $inner = $paneWidth - 2
-    $rows = [Math]::Max(6, $height - 10)
+    $rows = [Math]::Max(6, $height - 9)
+    $showDate = $inner -ge 48
     Adjust-Offsets $rows
 
-    Clear-Host
-    Write-Host (Fit-Text "TUNNELPANE  Local: $LocalDirectory" ($width - 1))
-    $border = "-" * $paneWidth
-    Write-Host "$border $border"
-    $leftTitle = if ($ActivePane -eq "local") { ">LOCAL" } else { " LOCAL" }
-    $rightTitle = if ($ActivePane -eq "server") { ">SERVER" } else { " SERVER" }
-    Write-Host "|$(Fit-Text $leftTitle $inner)| |$(Fit-Text "$rightTitle  $($ServerItems.Count) file(s)" $inner)|"
+    [Console]::SetCursorPosition(0, 0)
+    $rightHeader = "HTTPS  |  $TransferWorkers PARALLEL WORKERS "
+    Write-Host -NoNewline " TUNNELPANE" -ForegroundColor Cyan
+    Write-Host -NoNewline (" " * [Math]::Max(1, $width - 11 - $rightHeader.Length))
+    Write-Host $rightHeader -ForegroundColor DarkGray
+    Write-Host (Fit-Text " LOCAL PATH  $LocalDirectory" $width) -ForegroundColor DarkGray
+
+    $localAccent = if ($ActivePane -eq "local") { [ConsoleColor]::Cyan } else { [ConsoleColor]::DarkGray }
+    $serverAccent = if ($ActivePane -eq "server") { [ConsoleColor]::Yellow } else { [ConsoleColor]::DarkGray }
+    Write-Host -NoNewline (New-TitleBorder "LOCAL  $($LocalItems.Count) items" $paneWidth) -ForegroundColor $localAccent
+    Write-Host -NoNewline "  "
+    Write-Host (New-TitleBorder "SERVER  $($ServerItems.Count) files" $paneWidth) -ForegroundColor $serverAccent
+
+    $leftHeader = New-ItemRow "NAME" "SIZE" "" $inner " " $false
+    $rightHeaderRow = New-ItemRow "NAME" "SIZE" "MODIFIED" $inner " " $showDate
+    Write-PaneRow $leftHeader $false $false $false ([ConsoleColor]::DarkGray)
+    Write-Host -NoNewline "  "
+    Write-PaneRow $rightHeaderRow $false $false $false ([ConsoleColor]::DarkGray)
+    Write-Host
+    $separator = "-" * $inner
+    Write-Host "|$separator|  |$separator|" -ForegroundColor DarkGray
 
     for ($row = 0; $row -lt $rows; $row++) {
         $li = $LocalOffset + $row
         $si = $ServerOffset + $row
-        $left = ""
-        $right = ""
+        $left = Fit-Text "" $inner
+        $right = Fit-Text "" $inner
+        $leftSelected = $false
+        $rightSelected = $false
+        $isDirectory = $false
         if ($li -lt $LocalItems.Count) {
             $marker = if ($li -eq $LocalSelected) { if ($ActivePane -eq "local") { ">" } else { "*" } } else { " " }
-            $left = "$marker $($LocalItems[$li].Name)  $($LocalItems[$li].SizeLabel)"
+            $leftSelected = $li -eq $LocalSelected
+            $isDirectory = $LocalItems[$li].IsDirectory
+            $left = New-ItemRow $LocalItems[$li].Name $LocalItems[$li].SizeLabel "" $inner $marker $false
         }
         if ($si -lt $ServerItems.Count) {
             $marker = if ($si -eq $ServerSelected) { if ($ActivePane -eq "server") { ">" } else { "*" } } else { " " }
-            $right = "$marker $($ServerItems[$si].name)  $($ServerItems[$si].sizeLabel)"
+            $rightSelected = $si -eq $ServerSelected
+            $modified = if ($showDate) { ([string]$ServerItems[$si].modified).Replace("T", " ").Substring(0, [Math]::Min(16, ([string]$ServerItems[$si].modified).Length)) } else { "" }
+            $right = New-ItemRow $ServerItems[$si].name $ServerItems[$si].sizeLabel $modified $inner $marker $showDate
+        } elseif ($ServerItems.Count -eq 0 -and $row -eq 0) {
+            $right = Fit-Text "  No files on server" $inner
         }
-        Write-Host "|$(Fit-Text $left $inner)| |$(Fit-Text $right $inner)|"
+        Write-PaneRow $left $leftSelected ($ActivePane -eq "local") $isDirectory $localAccent
+        Write-Host -NoNewline "  "
+        Write-PaneRow $right $rightSelected ($ActivePane -eq "server") $false $serverAccent
+        Write-Host
     }
 
-    Write-Host "$border $border"
-    Write-Host "[Tab/Left/Right] Pane  [Up/Down or j/k] Select  [Enter] Open folder"
-    Write-Host "[u] Upload selected  [d] Download selected  [x] Delete server file  [r] Refresh"
-    Write-Host "[Esc/Ctrl+C] Cancel  [q] Quit"
-    Write-Host -NoNewline (Fit-Text "Workers: $TransferWorkers  |  Status: $Status" ($width - 1))
+    $bottom = "+-" + ("-" * ($paneWidth - 4)) + "-+"
+    Write-Host "$bottom  $bottom" -ForegroundColor DarkGray
+    Write-Key "TAB"; Write-Host -NoNewline " pane   "; Write-Key "J/K"; Write-Host -NoNewline " move   "; Write-Key "ENTER"; Write-Host -NoNewline " open   "; Write-Key "U"; Write-Host -NoNewline " upload   "; Write-Key "D"; Write-Host " download"
+    Write-Key "X"; Write-Host -NoNewline " delete  "; Write-Key "R"; Write-Host -NoNewline " refresh "; Write-Key "ESC"; Write-Host -NoNewline " cancel  "; Write-Key "Q"; Write-Host " quit"
+
+    $statusColor = [ConsoleColor]::Cyan
+    $statusLabel = " READY "
+    if ($Status -match "fail|error|cannot") { $statusColor = [ConsoleColor]::Red; $statusLabel = " ERROR " }
+    elseif ($Status -match "cancelled") { $statusColor = [ConsoleColor]::Yellow; $statusLabel = " PAUSED " }
+    elseif ($Status -match "\[y/N") { $statusColor = [ConsoleColor]::Yellow; $statusLabel = " ACTION " }
+    elseif ($Status -match "^(Uploaded|Downloaded|Deleted)") { $statusColor = [ConsoleColor]::Green; $statusLabel = " DONE  " }
+    Write-Host -NoNewline $statusLabel -ForegroundColor Black -BackgroundColor $statusColor
+    Write-Host -NoNewline (Fit-Text " $Status" ($width - $statusLabel.Length))
 }
 
 function Read-KeyName {
@@ -172,13 +250,23 @@ function Show-TransferProgress([string]$Action, [string]$Name, [long]$Transferre
     $percent = if ($Total -gt 0) { [Math]::Min(100, [Math]::Floor($Transferred * 100 / $Total)) } else { 100 }
     $elapsed = [Math]::Max(1, ([DateTime]::UtcNow - $Started).TotalSeconds)
     $rate = [long]($Transferred / $elapsed)
-    $barWidth = 24
+    try { $width = [Console]::WindowWidth - 1 } catch { $width = 79 }
+    $nameWidth = if ($width -gt 110) { 24 } else { 14 }
+    $displayName = Fit-Text $Name $nameWidth
+    if ($width -lt 96) {
+        $details = "{0,3}%  {1}/{2}  ESC CANCEL" -f $percent, (Format-Size $Transferred), (Format-Size $Total)
+    } else {
+        $details = "{0,3}%  {1}/{2}  {3}/s  {4}W  ESC CANCEL" -f $percent, (Format-Size $Transferred), (Format-Size $Total), (Format-Size $rate), $Workers
+    }
+    $barWidth = [Math]::Max(10, [Math]::Min(32, $width - $Action.Length - $nameWidth - $details.Length - 13))
     $filled = [int][Math]::Floor($percent * $barWidth / 100)
-    $bar = ("#" * $filled) + ("-" * ($barWidth - $filled))
-    $displayName = if ($Name.Length -gt 18) { $Name.Substring(0, 15) + "..." } else { $Name.PadRight(18) }
-    $line = "{0,-8} {1} [{2}] {3,3}%  {4}/{5}  {6}/s  {7} workers  Esc/Ctrl+C cancels" -f $Action, $displayName, $bar, $percent, (Format-Size $Transferred), (Format-Size $Total), (Format-Size $rate), $Workers
-    try { $width = [Math]::Max(64, [Console]::WindowWidth) } catch { $width = 80 }
-    Write-Host -NoNewline ("`r" + (Fit-Text $line ($width - 1)))
+    Write-Host -NoNewline "`r"
+    Write-Host -NoNewline (" {0,-8}" -f $Action) -ForegroundColor Cyan
+    Write-Host -NoNewline " $displayName  ["
+    Write-Host -NoNewline ("#" * $filled) -ForegroundColor Green
+    Write-Host -NoNewline ("-" * ($barWidth - $filled)) -ForegroundColor DarkGray
+    $tail = "]  $details"
+    Write-Host -NoNewline (Fit-Text $tail ($width - 13 - $nameWidth - $barWidth))
 }
 
 function Dispose-ActiveTransfers($Active) {
@@ -403,6 +491,7 @@ try {
 
 $oldControlC = [Console]::TreatControlCAsInput
 [Console]::TreatControlCAsInput = $true
+try { $oldCursorVisible = [Console]::CursorVisible; [Console]::CursorVisible = $false } catch { $oldCursorVisible = $true }
 try {
     while ($true) {
         Show-Panes
@@ -445,6 +534,7 @@ try {
     }
 } finally {
     [Console]::TreatControlCAsInput = $oldControlC
+    try { [Console]::CursorVisible = $oldCursorVisible } catch {}
     if ($Http) { $Http.Dispose() }
     $Password = $null
     $Token = $null

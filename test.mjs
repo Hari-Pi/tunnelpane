@@ -31,7 +31,8 @@ try {
   assert.doesNotMatch(zshClient, /__TUNNELPANE_URL__/);
   assert.doesNotMatch(powershellClient, /__TUNNELPANE_URL__/);
   assert.match(zshClient, /printf 'Username: '/);
-  assert.match(zshClient, /Tab\/Left\/Right/);
+  assert.match(zshClient, /terminal_enter/);
+  assert.match(zshClient, /print_key 'TAB'/);
   assert.match(zshClient, /monitor_workers/);
   assert.match(zshClient, /format=tsv2/);
   assert.match(powershellClient, /Read-Host "Password" -AsSecureString/);
@@ -39,6 +40,7 @@ try {
   assert.match(powershellClient, /TreatControlCAsInput/);
   assert.match(powershellClient, /Wait-CancellableTask/);
   assert.match(powershellClient, /Show-TransferProgress/);
+  assert.match(powershellClient, /Write-PaneRow/);
   assert.match(powershellClient, /api\/cli\/uploads/);
 
   let response = await fetch(base + '/hello.txt', { method: 'PUT', headers: { Authorization: auth }, body: 'hello world' });

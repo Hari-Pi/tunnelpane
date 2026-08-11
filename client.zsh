@@ -13,6 +13,7 @@ LOCAL_OFFSET=1
 SERVER_OFFSET=1
 STATUS='Ready.'
 INTERRUPTED=0
+UI_ACTIVE=0
 TRANSFER_WORKERS="${TUNNELPANE_TRANSFERS:-4}"
 TRANSFER_PART_SIZE=8388608
 [[ "$TRANSFER_WORKERS" != <-> || "$TRANSFER_WORKERS" -lt 1 ]] && TRANSFER_WORKERS=4
@@ -20,6 +21,23 @@ TRANSFER_PART_SIZE=8388608
 typeset -a LOCAL_PATHS LOCAL_NAMES LOCAL_TYPES LOCAL_SIZES
 typeset -a SERVER_IDS SERVER_NAMES SERVER_SIZES SERVER_DATES SERVER_BYTES
 typeset -a WORKER_PIDS
+
+if [[ -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then
+  C_RESET=$'\e[0m'
+  C_BOLD=$'\e[1m'
+  C_DIM=$'\e[2m'
+  C_LOCAL=$'\e[38;5;45m'
+  C_SERVER=$'\e[38;5;215m'
+  C_GREEN=$'\e[38;5;78m'
+  C_YELLOW=$'\e[38;5;221m'
+  C_RED=$'\e[38;5;203m'
+  C_SELECT=$'\e[30;48;5;45m'
+  C_SELECT_SERVER=$'\e[30;48;5;215m'
+  C_STATUS=$'\e[30;48;5;250m'
+else
+  C_RESET='' C_BOLD='' C_DIM='' C_LOCAL='' C_SERVER=''
+  C_GREEN='' C_YELLOW='' C_RED='' C_SELECT='' C_SELECT_SERVER='' C_STATUS=''
+fi
 
 if ! exec 3</dev/tty; then
   printf 'TunnelPane needs an interactive terminal.\n' >&2
@@ -148,6 +166,72 @@ repeat_char() {
   REPLY="${REPLY// /$1}"
 }
 
+terminal_size() {
+  local dimensions
+  dimensions=$(stty size <&3 2>/dev/null)
+  TERM_LINES="${dimensions%% *}"
+  TERM_COLS="${dimensions##* }"
+  [[ "$TERM_LINES" != <-> ]] && TERM_LINES=24
+  [[ "$TERM_COLS" != <-> ]] && TERM_COLS=80
+}
+
+terminal_enter() {
+  (( UI_ACTIVE )) && return
+  UI_ACTIVE=1
+  printf '\e[?1049h\e[?25l\e[2J\e[H'
+}
+
+terminal_leave() {
+  (( UI_ACTIVE )) || return
+  UI_ACTIVE=0
+  printf '\e[0m\e[?25h\e[?1049l'
+}
+
+title_border() {
+  local title="$1" width="$2" label remaining
+  label="+-- $title "
+  remaining=$(( width - ${#label} - 1 ))
+  (( remaining < 0 )) && remaining=0
+  repeat_char '-' "$remaining"
+  REPLY="$label$REPLY+"
+}
+
+build_item_row() {
+  local name="$1" size="$2" date="$3" width="$4" marker="$5" show_date="$6"
+  local name_width display
+  if (( show_date )); then
+    name_width=$(( width - 31 ))
+    (( name_width < 8 )) && name_width=8
+    fit_text "$name" "$name_width"; display="$REPLY"
+    printf -v REPLY '%s %-*s %9s  %-16s ' "$marker" "$name_width" "$display" "$size" "$date"
+  else
+    name_width=$(( width - 14 ))
+    (( name_width < 8 )) && name_width=8
+    fit_text "$name" "$name_width"; display="$REPLY"
+    printf -v REPLY '%s %-*s %9s ' "$marker" "$name_width" "$display" "$size"
+  fi
+  fit_text "$REPLY" "$width"
+}
+
+print_pane_row() {
+  local row="$1" selected="$2" active="$3" kind="$4" accent="$5"
+  printf '%s|%s' "$accent" "$C_RESET"
+  if (( selected && active )); then
+    [[ "$accent" == "$C_LOCAL" ]] && printf '%s%s%s' "$C_SELECT" "$row" "$C_RESET" || printf '%s%s%s' "$C_SELECT_SERVER" "$row" "$C_RESET"
+  elif (( selected )); then
+    printf '%s%s%s' "$C_BOLD" "$row" "$C_RESET"
+  elif [[ "$kind" == dir ]]; then
+    printf '%s%s%s' "$C_LOCAL" "$row" "$C_RESET"
+  else
+    printf '%s' "$row"
+  fi
+  printf '%s|%s' "$accent" "$C_RESET"
+}
+
+print_key() {
+  printf '%s%s%-5s%s' "$C_BOLD" "$C_LOCAL" "$1" "$C_RESET"
+}
+
 adjust_offsets() {
   if (( LOCAL_SELECTED > 0 )); then
     (( LOCAL_SELECTED < LOCAL_OFFSET )) && LOCAL_OFFSET=$LOCAL_SELECTED
@@ -164,61 +248,93 @@ adjust_offsets() {
 }
 
 show_panes() {
-  local cols lines pane_width inner row li si left right marker title_left title_right
-  cols=$(tput cols 2>/dev/null || printf 80)
-  lines=$(tput lines 2>/dev/null || printf 24)
-  (( cols < 64 )) && cols=64
-  pane_width=$(( (cols - 1) / 2 ))
+  local cols lines gap pane_width inner row li si left right marker left_selected right_selected left_kind
+  local left_border right_border header_left header_right header_gap path_label show_server_date status_color status_label
+  terminal_size
+  cols=$TERM_COLS
+  lines=$TERM_LINES
+  if (( cols < 72 || lines < 16 )); then
+    printf '\e[H\e[2J%sTunnelPane needs at least 72 columns and 16 rows.%s' "$C_YELLOW" "$C_RESET"
+    return
+  fi
+  gap=2
+  pane_width=$(( (cols - gap) / 2 ))
   inner=$(( pane_width - 2 ))
-  VIEW_ROWS=$(( lines - 10 ))
+  VIEW_ROWS=$(( lines - 9 ))
   (( VIEW_ROWS < 6 )) && VIEW_ROWS=6
+  show_server_date=0
+  (( inner >= 48 )) && show_server_date=1
   adjust_offsets
 
-  clear
-  fit_text "TUNNELPANE  Local: $LOCAL_DIR" "$(( cols - 1 ))"
-  printf '%s\n' "$REPLY"
-  repeat_char '-' "$pane_width"
-  printf '%s %s\n' "$REPLY" "$REPLY"
+  printf '\e[H'
+  header_left=' TUNNELPANE'
+  header_right="HTTPS  |  $TRANSFER_WORKERS PARALLEL WORKERS "
+  header_gap=$(( cols - ${#header_left} - ${#header_right} ))
+  (( header_gap < 1 )) && header_gap=1
+  printf '%s%s%s%s%*s%s%s%s\n' "$C_BOLD" "$C_LOCAL" "$header_left" "$C_RESET" "$header_gap" '' "$C_DIM" "$header_right" "$C_RESET"
+  path_label=" LOCAL PATH  $LOCAL_DIR"
+  fit_text "$path_label" "$cols"
+  printf '%s%s%s\n' "$C_DIM" "$REPLY" "$C_RESET"
 
-  title_left=' LOCAL'
-  title_right=' SERVER'
-  [[ "$ACTIVE_PANE" == local ]] && title_left='>LOCAL'
-  [[ "$ACTIVE_PANE" == server ]] && title_right='>SERVER'
-  fit_text "$title_left" "$inner"; left="$REPLY"
-  fit_text "$title_right  ${#SERVER_IDS} file(s)" "$inner"; right="$REPLY"
-  printf '|%s| |%s|\n' "$left" "$right"
+  title_border "LOCAL  ${#LOCAL_PATHS} items" "$pane_width"; left_border="$REPLY"
+  title_border "SERVER  ${#SERVER_IDS} files" "$pane_width"; right_border="$REPLY"
+  printf '%s%s%s  %s%s%s\n' "$([[ "$ACTIVE_PANE" == local ]] && printf '%s' "$C_LOCAL" || printf '%s' "$C_DIM")" "$left_border" "$C_RESET" "$([[ "$ACTIVE_PANE" == server ]] && printf '%s' "$C_SERVER" || printf '%s' "$C_DIM")" "$right_border" "$C_RESET"
+
+  build_item_row 'NAME' 'SIZE' 'MODIFIED' "$inner" ' ' 0; left="$REPLY"
+  build_item_row 'NAME' 'SIZE' 'MODIFIED' "$inner" ' ' "$show_server_date"; right="$REPLY"
+  printf '%s|%s%s%s|%s  %s|%s%s%s|%s\n' "$C_DIM" "$C_BOLD" "$left" "$C_RESET" "$C_DIM" "$C_DIM" "$C_BOLD" "$right" "$C_RESET" "$C_DIM"
+  repeat_char '-' "$inner"
+  printf '%s|%s|%s  %s|%s|%s\n' "$C_DIM" "$REPLY" "$C_RESET" "$C_DIM" "$REPLY" "$C_RESET"
 
   for (( row = 0; row < VIEW_ROWS; row++ )); do
     li=$(( LOCAL_OFFSET + row ))
     si=$(( SERVER_OFFSET + row ))
-    left=''
-    right=''
+    left_selected=0 right_selected=0 left_kind=''
     if (( li <= ${#LOCAL_PATHS} )); then
       marker=' '
-      (( li == LOCAL_SELECTED )) && marker=$([[ "$ACTIVE_PANE" == local ]] && printf '>' || printf '*')
-      fit_text "$marker ${LOCAL_NAMES[$li]}  ${LOCAL_SIZES[$li]}" "$inner"
+      if (( li == LOCAL_SELECTED )); then
+        left_selected=1
+        marker=$([[ "$ACTIVE_PANE" == local ]] && printf '>' || printf '*')
+      fi
+      left_kind="${LOCAL_TYPES[$li]}"
+      build_item_row "${LOCAL_NAMES[$li]}" "${LOCAL_SIZES[$li]}" '' "$inner" "$marker" 0
       left="$REPLY"
     else
       fit_text '' "$inner"; left="$REPLY"
     fi
     if (( si <= ${#SERVER_IDS} )); then
       marker=' '
-      (( si == SERVER_SELECTED )) && marker=$([[ "$ACTIVE_PANE" == server ]] && printf '>' || printf '*')
-      fit_text "$marker ${SERVER_NAMES[$si]}  ${SERVER_SIZES[$si]}" "$inner"
+      if (( si == SERVER_SELECTED )); then
+        right_selected=1
+        marker=$([[ "$ACTIVE_PANE" == server ]] && printf '>' || printf '*')
+      fi
+      build_item_row "${SERVER_NAMES[$si]}" "${SERVER_SIZES[$si]}" "${SERVER_DATES[$si]}" "$inner" "$marker" "$show_server_date"
       right="$REPLY"
     else
-      fit_text '' "$inner"; right="$REPLY"
+      if (( ${#SERVER_IDS} == 0 && row == 0 )); then fit_text '  No files on server' "$inner"; else fit_text '' "$inner"; fi
+      right="$REPLY"
     fi
-    printf '|%s| |%s|\n' "$left" "$right"
+    print_pane_row "$left" "$left_selected" "$([[ "$ACTIVE_PANE" == local ]] && printf 1 || printf 0)" "$left_kind" "$([[ "$ACTIVE_PANE" == local ]] && printf '%s' "$C_LOCAL" || printf '%s' "$C_DIM")"
+    printf '  '
+    print_pane_row "$right" "$right_selected" "$([[ "$ACTIVE_PANE" == server ]] && printf 1 || printf 0)" file "$([[ "$ACTIVE_PANE" == server ]] && printf '%s' "$C_SERVER" || printf '%s' "$C_DIM")"
+    printf '\n'
   done
 
-  repeat_char '-' "$pane_width"
-  printf '%s %s\n' "$REPLY" "$REPLY"
-  printf '%s\n' '[Tab/Left/Right] Pane  [Up/Down or j/k] Select  [Enter] Open folder'
-  printf '%s\n' '[u] Upload selected  [d] Download selected  [x] Delete server file  [r] Refresh'
-  printf '%s\n' '[Esc/Ctrl+C] Cancel  [q] Quit'
-  fit_text "Workers: $TRANSFER_WORKERS  |  Status: $STATUS" "$(( cols - 1 ))"
-  printf '%s' "$REPLY"
+  repeat_char '-' "$(( pane_width - 4 ))"
+  printf '%s+-%s-+%s  %s+-%s-+%s\n' "$C_DIM" "$REPLY" "$C_RESET" "$C_DIM" "$REPLY" "$C_RESET"
+
+  print_key 'TAB'; printf ' pane   '; print_key 'J/K'; printf ' move   '; print_key 'ENTER'; printf ' open   '; print_key 'U'; printf ' upload   '; print_key 'D'; printf ' download\n'
+  print_key 'X'; printf ' delete  '; print_key 'R'; printf ' refresh '; print_key 'ESC'; printf ' cancel  '; print_key 'Q'; printf ' quit'
+  printf '%*s\n' "$(( cols > 58 ? cols - 58 : 1 ))" ''
+
+  status_color="$C_LOCAL"
+  status_label=' READY '
+  [[ "${STATUS:l}" == *fail* || "${STATUS:l}" == *error* || "${STATUS:l}" == *cannot* ]] && { status_color="$C_RED"; status_label=' ERROR '; }
+  [[ "${STATUS:l}" == *cancelled* ]] && { status_color="$C_YELLOW"; status_label=' PAUSED '; }
+  [[ "$STATUS" == *'[y/N'* ]] && { status_color="$C_SERVER"; status_label=' ACTION '; }
+  [[ "${STATUS:l}" == uploaded* || "${STATUS:l}" == downloaded* || "${STATUS:l}" == deleted* ]] && { status_color="$C_GREEN"; status_label=' DONE  '; }
+  fit_text "$status_label $STATUS" "$cols"
+  printf '%s%s%s%s' "$C_BOLD" "$status_color" "$REPLY" "$C_RESET"
 }
 
 read_key() {
@@ -279,7 +395,7 @@ run_cancellable() {
 
 progress_line() {
   local action="$1" name="$2" transferred="$3" total="$4" workers="$5" started="$6"
-  local percent elapsed rate done_label total_label rate_label bar_width filled empty bar
+  local percent elapsed rate done_label total_label rate_label bar_width filled empty done_bar todo_bar details max_name
   if (( total > 0 )); then percent=$(( transferred * 100 / total )); else percent=100; fi
   (( percent > 100 )) && percent=100
   elapsed=$(( EPOCHSECONDS - started ))
@@ -288,12 +404,22 @@ progress_line() {
   format_size "$transferred"; done_label="$REPLY"
   format_size "$total"; total_label="$REPLY"
   format_size "$rate"; rate_label="$REPLY/s"
-  bar_width=24
+  terminal_size
+  max_name=$(( TERM_COLS > 110 ? 24 : 14 ))
+  fit_text "$name" "$max_name"; name="$REPLY"
+  if (( TERM_COLS < 96 )); then
+    details=$(printf '%3d%%  %s/%s  ESC CANCEL' "$percent" "$done_label" "$total_label")
+  else
+    details=$(printf '%3d%%  %s/%s  %s  %dW  ESC CANCEL' "$percent" "$done_label" "$total_label" "$rate_label" "$workers")
+  fi
+  bar_width=$(( TERM_COLS - ${#action} - ${#name} - ${#details} - 13 ))
+  (( bar_width < 10 )) && bar_width=10
+  (( bar_width > 32 )) && bar_width=32
   filled=$(( percent * bar_width / 100 ))
   empty=$(( bar_width - filled ))
-  printf -v bar '%*s' "$filled" ''; bar="${bar// /#}"
-  printf -v REPLY '%*s' "$empty" ''; bar+="${REPLY// /-}"
-  printf '\r\033[K%s %-18s [%s] %3d%%  %s/%s  %s  %d workers  Esc/Ctrl+C cancels' "$action" "${name[1,18]}" "$bar" "$percent" "$done_label" "$total_label" "$rate_label" "$workers"
+  repeat_char '#' "$filled"; done_bar="$REPLY"
+  repeat_char '-' "$empty"; todo_bar="$REPLY"
+  printf '\r\e[K%s%s %-8s%s %s  [%s%s%s%s]  %s%s' "$C_BOLD" "$C_LOCAL" "$action" "$C_RESET" "$name" "$C_GREEN" "$done_bar" "$C_DIM" "$todo_bar" "$C_RESET" "$details"
 }
 
 stop_workers() {
@@ -524,6 +650,7 @@ if ! load_server; then
   exit 1
 fi
 
+terminal_enter
 while true; do
   show_panes
   read_key || break
@@ -569,6 +696,6 @@ while true; do
   esac
 done
 
+terminal_leave
 unset password AUTH_HEADER
-clear
 printf 'Signed out of TunnelPane.\n'
