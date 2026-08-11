@@ -81,22 +81,25 @@ const HTML = String.raw`<!doctype html>
   <header><div class="shell header-row"><div class="brand">Tunnel<span>Pane</span></div><div class="storage" id="storage">Checking storage...</div></div></header>
   <main class="shell">
     <section class="upload-band" id="dropZone">
-      <strong>Upload files</strong><p>Drop files here or choose them from your device.</p>
-      <button class="primary" id="chooseButton" type="button">Choose files</button><input id="fileInput" type="file" multiple hidden>
+      <strong>Upload files</strong><p>Drop files here or choose files or a folder from your device.</p>
+      <button class="primary" id="chooseButton" type="button">Choose files</button> <button class="secondary" id="chooseFolderButton" type="button">Choose folder</button><input id="fileInput" type="file" multiple hidden><input id="folderInput" type="file" webkitdirectory multiple hidden>
       <div class="queue" id="queue"></div>
     </section>
     <div class="toolbar">
       <input class="search" id="search" type="search" placeholder="Search files" aria-label="Search files">
       <select class="sort" id="sort" aria-label="Sort files"><option value="name">Name</option><option value="date">Newest</option><option value="size">Largest</option></select>
+      <button class="secondary" id="up" type="button">Up</button>
+      <button class="secondary" id="newFolder" type="button">New folder</button>
       <button class="secondary" id="refresh" type="button">Refresh</button>
     </div>
     <div class="table-wrap"><table><thead><tr><th>File</th><th>Size</th><th>Modified</th><th></th></tr></thead><tbody id="files"></tbody></table><div class="empty" id="empty">No files yet.</div></div>
   </main>
   <div class="notice" id="notice" role="status"></div>
   <script>
-    var files = [];
+    var files = [], currentPath = '';
     var chunkSize = 8 * 1024 * 1024;
     var fileInput = document.getElementById('fileInput');
+    var folderInput = document.getElementById('folderInput');
     var dropZone = document.getElementById('dropZone');
     var queue = document.getElementById('queue');
     var fileBody = document.getElementById('files');
@@ -119,7 +122,8 @@ const HTML = String.raw`<!doctype html>
       if (!response.ok) throw new Error(body.error || 'Request failed');
       return body;
     }
-    function fileUrl(name) { return '/' + encodeURIComponent(name); }
+    function joined(name) { return currentPath ? currentPath + '/' + name : name }
+    function fileUrl(name) { return '/' + joined(name).split('/').map(encodeURIComponent).join('/'); }
     function render() {
       var query = document.getElementById('search').value.toLowerCase();
       var sort = document.getElementById('sort').value;
@@ -129,20 +133,22 @@ const HTML = String.raw`<!doctype html>
       shown.forEach(function(file){
         var row=document.createElement('tr');
         var name=document.createElement('td'); name.className='file-name';
-        var link=document.createElement('a'); link.href=fileUrl(file.name); link.textContent=file.name; name.appendChild(link);
-        var size=document.createElement('td'); size.textContent=formatBytes(file.size);
+        var link=document.createElement('a'); link.textContent=file.name+(file.type==='dir'?'/':'');
+        if(file.type==='dir'){link.href='#';link.onclick=function(event){event.preventDefault();currentPath=joined(file.name);refresh()}}else{link.href=fileUrl(file.name)} name.appendChild(link);
+        var size=document.createElement('td'); size.textContent=file.type==='dir'?'—':formatBytes(file.size);
         var date=document.createElement('td'); date.textContent=new Date(file.modified).toLocaleString();
         var actions=document.createElement('td'); actions.className='actions';
         var copy=document.createElement('button'); copy.className='icon-action'; copy.textContent='Copy URL'; copy.title='Copy download URL';
-        copy.onclick=async function(){await navigator.clipboard.writeText(location.origin+fileUrl(file.name));showNotice('Download URL copied')};
+        copy.style.display=file.type==='dir'?'none':'';copy.onclick=async function(){await navigator.clipboard.writeText(location.origin+fileUrl(file.name));showNotice('Download URL copied')};
         var remove=document.createElement('button'); remove.className='icon-action delete'; remove.textContent='Delete'; remove.title='Delete file';
-        remove.onclick=async function(){if(!confirm('Delete '+file.name+'?'))return;try{await api(fileUrl(file.name),{method:'DELETE'});showNotice('Deleted '+file.name);await refresh()}catch(error){showNotice(error.message,true)}};
+        remove.onclick=async function(){if(!confirm('Delete '+file.name+(file.type==='dir'?' and everything inside it':'')+'?'))return;try{await api('/api/cli/files/'+file.id,{method:'DELETE'});showNotice('Deleted '+file.name);await refresh()}catch(error){showNotice(error.message,true)}};
         actions.append(copy,remove); row.append(name,size,date,actions); fileBody.appendChild(row);
       });
     }
     async function refresh() {
       try {
-        var result=await api('/api/files'); files=result.files; render();
+        var result=await api('/api/files?path='+encodeURIComponent(currentPath)); files=result.files; render();
+        document.querySelector('.upload-band strong').textContent=currentPath?'Upload to /'+currentPath:'Upload files';document.getElementById('up').disabled=!currentPath;
         var status=await api('/api/status'); document.getElementById('storage').textContent=formatBytes(status.used)+' used / '+formatBytes(status.total)+' total';
       } catch(error) { showNotice(error.message,true); }
     }
@@ -156,7 +162,8 @@ const HTML = String.raw`<!doctype html>
     async function upload(file) {
       var ui=createJob(file);
       try {
-        var session=await api('/api/uploads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:file.name,size:file.size})});
+        var relative=file.webkitRelativePath||file.name;var target=currentPath?currentPath+'/'+relative:relative;
+        var session=await api('/api/uploads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:target,size:file.size})});
         var offset=session.offset;
         while(offset<file.size){
           var end=Math.min(offset+chunkSize,file.size);var chunk=file.slice(offset,end);
@@ -170,10 +177,14 @@ const HTML = String.raw`<!doctype html>
     }
     async function uploadAll(list){for(var i=0;i<list.length;i++)await upload(list[i])}
     document.getElementById('chooseButton').onclick=function(){fileInput.click()};
+    document.getElementById('chooseFolderButton').onclick=function(){folderInput.click()};
     fileInput.onchange=function(){uploadAll(Array.from(fileInput.files));fileInput.value=''};
+    folderInput.onchange=function(){uploadAll(Array.from(folderInput.files));folderInput.value=''};
     ['dragenter','dragover'].forEach(function(name){dropZone.addEventListener(name,function(event){event.preventDefault();dropZone.classList.add('drag')})});
     ['dragleave','drop'].forEach(function(name){dropZone.addEventListener(name,function(event){event.preventDefault();dropZone.classList.remove('drag')})});
     dropZone.addEventListener('drop',function(event){uploadAll(Array.from(event.dataTransfer.files))});
+    document.getElementById('up').onclick=function(){currentPath=currentPath.includes('/')?currentPath.slice(0,currentPath.lastIndexOf('/')):'';refresh()};
+    document.getElementById('newFolder').onclick=async function(){var name=prompt('Folder name');if(!name)return;try{var target=joined(name);var id=btoa(unescape(encodeURIComponent(target))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');await api('/api/cli/folders/'+id,{method:'POST'});await refresh()}catch(error){showNotice(error.message,true)}};
     document.getElementById('search').oninput=render;document.getElementById('sort').onchange=render;document.getElementById('refresh').onclick=refresh;
     refresh();
   </script>
@@ -243,10 +254,21 @@ function validFilename(name) {
   return typeof name === 'string' && name.length > 0 && Buffer.byteLength(name) <= 240 && name !== '.' && name !== '..' && !name.startsWith('.') && !name.includes('/') && !name.includes('\\') && !name.includes('\0');
 }
 
+function validRelativePath(value) {
+  return typeof value === 'string' && value.length > 0 && Buffer.byteLength(value) <= 2048 && value.split('/').every(validFilename);
+}
+
+function storagePath(relativePath) {
+  if (!validRelativePath(relativePath)) return null;
+  const target = path.resolve(DATA_DIR, ...relativePath.split('/'));
+  const root = path.resolve(DATA_DIR) + path.sep;
+  return target.startsWith(root) ? target : null;
+}
+
 function filenameFromPath(pathname) {
   try {
     const name = decodeURIComponent(pathname.slice(1));
-    return validFilename(name) ? name : null;
+    return validRelativePath(name) ? name : null;
   } catch { return null; }
 }
 
@@ -258,12 +280,17 @@ function filenameFromId(id) {
   if (!/^[A-Za-z0-9_-]+$/.test(id)) return null;
   try {
     const name = Buffer.from(id, 'base64url').toString('utf8');
-    return validFilename(name) && fileId(name) === id ? name : null;
+    return validRelativePath(name) && fileId(name) === id ? name : null;
   } catch { return null; }
 }
 
 function cliFileIdFromPath(pathname) {
   const match = pathname.match(/^\/api\/cli\/files\/([A-Za-z0-9_-]+)$/);
+  return match ? match[1] : null;
+}
+
+function cliFolderIdFromPath(pathname) {
+  const match = pathname.match(/^\/api\/cli\/folders\/([A-Za-z0-9_-]+)$/);
   return match ? match[1] : null;
 }
 
@@ -323,8 +350,26 @@ async function listFiles() {
   return files;
 }
 
+async function listDirectory(relativePath = '') {
+  const directory = relativePath ? storagePath(relativePath) : DATA_DIR;
+  if (!directory) throw Object.assign(new Error('Invalid directory'), { status: 400 });
+  let entries;
+  try { entries = await fs.readdir(directory, { withFileTypes: true }); } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') throw Object.assign(new Error('Directory not found'), { status: 404 });
+    throw error;
+  }
+  const items = [];
+  for (const entry of entries) {
+    if (entry.name.startsWith('.') || (!entry.isFile() && !entry.isDirectory())) continue;
+    const relative = relativePath ? `${relativePath}/${entry.name}` : entry.name;
+    const stat = await fs.stat(storagePath(relative));
+    items.push({ id: fileId(relative), name: entry.name, path: relative, type: entry.isDirectory() ? 'dir' : 'file', size: entry.isFile() ? stat.size : 0, modified: stat.mtimeMs });
+  }
+  return items.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1));
+}
+
 async function serveFile(req, res, name) {
-  const target = path.join(DATA_DIR, name);
+  const target = storagePath(name);
   let stat;
   try { stat = await fs.stat(target); } catch (error) {
     if (error.code === 'ENOENT') return json(res, 404, { error: 'File not found' }, securityHeaders());
@@ -336,7 +381,7 @@ async function serveFile(req, res, name) {
     ...securityHeaders(),
     'Accept-Ranges': 'bytes',
     'Content-Type': MIME_TYPES.get(path.extname(name).toLowerCase()) || 'application/octet-stream',
-    'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(name)}`,
+    'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(name))}`,
     'Last-Modified': stat.mtime.toUTCString(),
   };
   let start = 0;
@@ -366,7 +411,7 @@ async function serveFile(req, res, name) {
 
 async function startUpload(req, res) {
   const body = await readJson(req);
-  if (!validFilename(body.filename)) return json(res, 400, { error: 'Invalid filename' }, securityHeaders());
+  if (!validRelativePath(body.filename)) return json(res, 400, { error: 'Invalid filename' }, securityHeaders());
   if (!Number.isSafeInteger(body.size) || body.size < 0) return json(res, 400, { error: 'Invalid file size' }, securityHeaders());
   const id = crypto.randomUUID();
   const part = path.join(UPLOAD_DIR, id + '.part');
@@ -403,7 +448,9 @@ async function finishUpload(res, id) {
   const upload = await readUpload(id);
   const stat = await fs.stat(upload.partPath);
   if (stat.size !== upload.metadata.size) return json(res, 409, { error: 'Upload is incomplete', offset: stat.size, expected: upload.metadata.size }, securityHeaders());
-  await fs.rename(upload.partPath, path.join(DATA_DIR, upload.metadata.filename));
+  const target = storagePath(upload.metadata.filename);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.rename(upload.partPath, target);
   await fs.unlink(upload.metaPath);
   json(res, 200, { ok: true, name: upload.metadata.filename, size: stat.size }, securityHeaders());
 }
@@ -416,7 +463,9 @@ async function directUpload(req, res, name) {
   const temp = path.join(UPLOAD_DIR, crypto.randomUUID() + '.put');
   try {
     const size = await writeRequest(req, temp, 'wx', MAX_SINGLE_UPLOAD);
-    await fs.rename(temp, path.join(DATA_DIR, name));
+    const target = storagePath(name);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.rename(temp, target);
     json(res, 201, { ok: true, name, size }, securityHeaders());
   } catch (error) {
     await fs.rm(temp, { force: true });
@@ -453,7 +502,7 @@ async function startParallelUpload(req, res, url, fileIdValue) {
     return json(res, 400, { error: 'Invalid part size' }, securityHeaders());
   }
   const partCount = Math.max(1, Math.ceil(size / requestedPartSize));
-  if (partCount > 10000) return json(res, 413, { error: 'Upload requires too many parts' }, securityHeaders());
+  if (partCount > 100000) return json(res, 413, { error: 'Upload requires too many parts' }, securityHeaders());
   const id = crypto.randomUUID();
   const metadata = { id, filename, size, partSize: requestedPartSize, partCount, createdAt: Date.now() };
   await fs.writeFile(parallelMetaPath(id), JSON.stringify(metadata), { flag: 'wx', mode: 0o600 });
@@ -512,7 +561,9 @@ async function finishParallelUpload(res, id) {
     }
     const stat = await fs.stat(temporary);
     if (stat.size !== metadata.size) throw Object.assign(new Error('Assembled upload size mismatch'), { status: 409 });
-    await fs.rename(temporary, path.join(DATA_DIR, metadata.filename));
+    const target = storagePath(metadata.filename);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.rename(temporary, target);
     await removeParallelUpload(id, metadata);
     return json(res, 200, { ok: true, name: metadata.filename, size: metadata.size }, securityHeaders());
   } finally {
@@ -547,20 +598,36 @@ async function handle(req, res) {
     res.writeHead(200, { ...securityHeaders(), 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': Buffer.byteLength(HTML) });
     return res.end(HTML);
   }
-  if (req.method === 'GET' && url.pathname === '/api/files') return json(res, 200, { files: await listFiles() }, securityHeaders());
+  if (req.method === 'GET' && url.pathname === '/api/files') {
+    const directory = url.searchParams.get('path') || '';
+    if (directory && !validRelativePath(directory)) return json(res, 400, { error: 'Invalid directory' }, securityHeaders());
+    return json(res, 200, { path: directory, files: await listDirectory(directory) }, securityHeaders());
+  }
   if (req.method === 'GET' && url.pathname === '/api/cli/files') {
-    const files = (await listFiles()).sort((a, b) => a.name.localeCompare(b.name));
+    const directoryId = url.searchParams.get('path');
+    const directory = directoryId ? filenameFromId(directoryId) : '';
+    if (directoryId && !directory) return json(res, 400, { error: 'Invalid directory' }, securityHeaders());
+    const files = await listDirectory(directory);
+    const regularFiles = files.filter(file => file.type === 'file');
     if (url.searchParams.get('format') === 'tsv') {
-      const body = files.map(file => [file.id, Buffer.from(file.name).toString('base64'), formatBytes(file.size), new Date(file.modified).toISOString()].join('\t')).join('\n') + (files.length ? '\n' : '');
+      const body = regularFiles.map(file => [file.id, Buffer.from(file.name).toString('base64'), formatBytes(file.size), new Date(file.modified).toISOString()].join('\t')).join('\n') + (regularFiles.length ? '\n' : '');
       res.writeHead(200, { ...securityHeaders(), 'Content-Type': 'text/tab-separated-values; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
       return res.end(body);
     }
     if (url.searchParams.get('format') === 'tsv2') {
-      const body = files.map(file => [file.id, Buffer.from(file.name).toString('base64'), formatBytes(file.size), new Date(file.modified).toISOString(), file.size].join('\t')).join('\n') + (files.length ? '\n' : '');
+      const body = regularFiles.map(file => [file.id, Buffer.from(file.name).toString('base64'), formatBytes(file.size), new Date(file.modified).toISOString(), file.size].join('\t')).join('\n') + (regularFiles.length ? '\n' : '');
       res.writeHead(200, { ...securityHeaders(), 'Content-Type': 'text/tab-separated-values; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
       return res.end(body);
     }
-    return json(res, 200, { files: files.map(file => ({ ...file, sizeLabel: formatBytes(file.size) })) }, securityHeaders());
+    if (url.searchParams.get('format') === 'tsv3') {
+      const body = files.map(file => [file.id, Buffer.from(file.name).toString('base64'), file.type, file.type === 'dir' ? '-' : formatBytes(file.size), new Date(file.modified).toISOString(), file.size].join('\t')).join('\n') + (files.length ? '\n' : '');
+      res.writeHead(200, { ...securityHeaders(), 'Content-Type': 'text/tab-separated-values; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
+      return res.end(body);
+    }
+    if (url.searchParams.get('format') === 'json3') {
+      return json(res, 200, { path: directory, files: files.map(file => ({ ...file, sizeLabel: file.type === 'dir' ? '-' : formatBytes(file.size) })) }, securityHeaders());
+    }
+    return json(res, 200, { files: regularFiles.map(file => ({ ...file, sizeLabel: formatBytes(file.size) })) }, securityHeaders());
   }
   if (req.method === 'GET' && url.pathname === '/api/status') {
     const disk = await fs.statfs(DATA_DIR);
@@ -597,7 +664,7 @@ async function handle(req, res) {
     if (req.method === 'GET' || req.method === 'HEAD') return serveFile(req, res, cliName);
     if (req.method === 'PUT') return directUpload(req, res, cliName);
     if (req.method === 'DELETE') {
-      try { await fs.unlink(path.join(DATA_DIR, cliName)); } catch (error) {
+      try { await fs.rm(storagePath(cliName), { recursive: true }); } catch (error) {
         if (error.code === 'ENOENT') return json(res, 404, { error: 'File not found' }, securityHeaders());
         throw error;
       }
@@ -606,12 +673,23 @@ async function handle(req, res) {
     return json(res, 405, { error: 'Method not allowed' }, { ...securityHeaders(), Allow: 'GET, HEAD, PUT, DELETE' });
   }
 
+  const folderId = cliFolderIdFromPath(url.pathname);
+  if (folderId) {
+    const folder = filenameFromId(folderId);
+    if (!folder) return json(res, 400, { error: 'Invalid folder path' }, securityHeaders());
+    if (req.method === 'POST') {
+      await fs.mkdir(storagePath(folder), { recursive: true, mode: 0o700 });
+      return json(res, 201, { ok: true, path: folder }, securityHeaders());
+    }
+    return json(res, 405, { error: 'Method not allowed' }, { ...securityHeaders(), Allow: 'POST' });
+  }
+
   const name = filenameFromPath(url.pathname);
   if (!name) return json(res, 404, { error: 'Not found' }, securityHeaders());
   if (req.method === 'GET' || req.method === 'HEAD') return serveFile(req, res, name);
   if (req.method === 'PUT') return directUpload(req, res, name);
   if (req.method === 'DELETE') {
-    try { await fs.unlink(path.join(DATA_DIR, name)); } catch (error) {
+    try { await fs.rm(storagePath(name), { recursive: true }); } catch (error) {
       if (error.code === 'ENOENT') return json(res, 404, { error: 'File not found' }, securityHeaders());
       throw error;
     }

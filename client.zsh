@@ -6,6 +6,7 @@ zmodload zsh/datetime 2>/dev/null
 
 BASE_URL="${TUNNELPANE_URL:-__TUNNELPANE_URL__}"
 LOCAL_DIR="${PWD:A}"
+SERVER_DIR=''
 ACTIVE_PANE=local
 LOCAL_SELECTED=1
 SERVER_SELECTED=1
@@ -15,11 +16,11 @@ STATUS='Ready.'
 INTERRUPTED=0
 UI_ACTIVE=0
 TRANSFER_WORKERS="${TUNNELPANE_TRANSFERS:-4}"
-TRANSFER_PART_SIZE=8388608
+TRANSFER_PART_SIZE=16777216
 [[ "$TRANSFER_WORKERS" != <-> || "$TRANSFER_WORKERS" -lt 1 ]] && TRANSFER_WORKERS=4
 (( TRANSFER_WORKERS > 8 )) && TRANSFER_WORKERS=8
 typeset -a LOCAL_PATHS LOCAL_NAMES LOCAL_TYPES LOCAL_SIZES
-typeset -a SERVER_IDS SERVER_NAMES SERVER_SIZES SERVER_DATES SERVER_BYTES
+typeset -a SERVER_IDS SERVER_NAMES SERVER_TYPES SERVER_SIZES SERVER_DATES SERVER_BYTES
 typeset -a WORKER_PIDS
 
 if [[ -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then
@@ -121,22 +122,29 @@ load_local() {
 }
 
 load_server() {
-  local payload id encoded size modified bytes name
+  local payload id encoded type size modified bytes name path_query=''
   SERVER_IDS=()
   SERVER_NAMES=()
+  SERVER_TYPES=()
   SERVER_SIZES=()
   SERVER_DATES=()
   SERVER_BYTES=()
-  if ! payload=$(curl -fsS -H "$AUTH_HEADER" "$BASE_URL/api/cli/files?format=tsv2"); then
+  [[ -n "$SERVER_DIR" ]] && path_query="&path=$(file_id "$SERVER_DIR")"
+  if ! payload=$(curl -fsS -H "$AUTH_HEADER" "$BASE_URL/api/cli/files?format=tsv3$path_query"); then
     return 1
   fi
-  while IFS=$'\t' read -r id encoded size modified bytes; do
+  if [[ -n "$SERVER_DIR" ]]; then
+    SERVER_IDS+=('..') SERVER_NAMES+=('..') SERVER_TYPES+=('parent') SERVER_SIZES+=('-') SERVER_DATES+=('') SERVER_BYTES+=(0)
+  fi
+  while IFS=$'\t' read -r id encoded type size modified bytes; do
     [[ -z "$id" ]] && continue
     name=$(printf '%s' "$encoded" | base64 "$BASE64_DECODE" 2>/dev/null) || name='[invalid filename]'
     name="${name//$'\n'/ }"
     name="${name//$'\t'/ }"
     SERVER_IDS+=("$id")
-    SERVER_NAMES+=("$name")
+    [[ "$type" == dir ]] && name+='/ '
+    SERVER_NAMES+=("${name% }")
+    SERVER_TYPES+=("$type")
     SERVER_SIZES+=("$size")
     SERVER_DATES+=("${modified[1,16]/T/ }")
     SERVER_BYTES+=("$bytes")
@@ -277,7 +285,7 @@ show_panes() {
   printf '%s%s%s\n' "$C_DIM" "$REPLY" "$C_RESET"
 
   title_border "LOCAL  ${#LOCAL_PATHS} items" "$pane_width"; left_border="$REPLY"
-  title_border "SERVER  ${#SERVER_IDS} files" "$pane_width"; right_border="$REPLY"
+  title_border "SERVER  ${SERVER_DIR:-/}" "$pane_width"; right_border="$REPLY"
   printf '%s%s%s  %s%s%s\n' "$([[ "$ACTIVE_PANE" == local ]] && printf '%s' "$C_LOCAL" || printf '%s' "$C_DIM")" "$left_border" "$C_RESET" "$([[ "$ACTIVE_PANE" == server ]] && printf '%s' "$C_SERVER" || printf '%s' "$C_DIM")" "$right_border" "$C_RESET"
 
   build_item_row 'NAME' 'SIZE' 'MODIFIED' "$inner" ' ' 0; left="$REPLY"
@@ -316,7 +324,7 @@ show_panes() {
     fi
     print_pane_row "$left" "$left_selected" "$([[ "$ACTIVE_PANE" == local ]] && printf 1 || printf 0)" "$left_kind" "$([[ "$ACTIVE_PANE" == local ]] && printf '%s' "$C_LOCAL" || printf '%s' "$C_DIM")"
     printf '  '
-    print_pane_row "$right" "$right_selected" "$([[ "$ACTIVE_PANE" == server ]] && printf 1 || printf 0)" file "$([[ "$ACTIVE_PANE" == server ]] && printf '%s' "$C_SERVER" || printf '%s' "$C_DIM")"
+    print_pane_row "$right" "$right_selected" "$([[ "$ACTIVE_PANE" == server ]] && printf 1 || printf 0)" "${SERVER_TYPES[$si]:-file}" "$([[ "$ACTIVE_PANE" == server ]] && printf '%s' "$C_SERVER" || printf '%s' "$C_DIM")"
     printf '\n'
   done
 
@@ -324,8 +332,7 @@ show_panes() {
   printf '%s+-%s-+%s  %s+-%s-+%s\n' "$C_DIM" "$REPLY" "$C_RESET" "$C_DIM" "$REPLY" "$C_RESET"
 
   print_key 'TAB'; printf ' pane   '; print_key 'J/K'; printf ' move   '; print_key 'ENTER'; printf ' open   '; print_key 'U'; printf ' upload   '; print_key 'D'; printf ' download\n'
-  print_key 'X'; printf ' delete  '; print_key 'R'; printf ' refresh '; print_key 'ESC'; printf ' cancel  '; print_key 'Q'; printf ' quit'
-  printf '%*s\n' "$(( cols > 58 ? cols - 58 : 1 ))" ''
+  print_key 'M'; printf ' mkdir   '; print_key 'X'; printf ' delete  '; print_key 'R'; printf ' refresh '; print_key 'ESC'; printf ' cancel  '; print_key 'Q'; printf ' quit\n'
 
   status_color="$C_LOCAL"
   status_label=' READY '
@@ -474,35 +481,31 @@ selected_local_file() {
 }
 
 selected_server_file() {
-  (( SERVER_SELECTED > 0 ))
+  (( SERVER_SELECTED > 0 )) && [[ "${SERVER_TYPES[$SERVER_SELECTED]}" == file ]]
 }
 
-upload_selected() {
-  local source_path name id size session_info session part_size part_count state_dir worker_count worker part expected rc
-  if [[ "$ACTIVE_PANE" != local ]] || ! selected_local_file; then
-    STATUS='Select a file in the local pane to upload.'
-    return
-  fi
-  source_path="${LOCAL_PATHS[$LOCAL_SELECTED]}"
-  name="${source_path:t}"
-  if [[ "$name" == .* ]]; then
-    STATUS='Server filenames cannot begin with a dot.'
-    return
-  fi
-  confirm_action "Upload \"$name\"?" || { STATUS='Upload cancelled.'; return; }
-  id=$(file_id "$name")
+create_server_folder_path() {
+  local id
+  id=$(file_id "$1")
+  curl -fsS -o /dev/null -H "$AUTH_HEADER" -X POST "$BASE_URL/api/cli/folders/$id"
+}
+
+upload_file() {
+  local source_path="$1" target_path="$2" name="$3"
+  local id size session_info session part_size part_count state_dir worker_count worker part expected rc
+  id=$(file_id "$target_path")
   local_file_size "$source_path"
   size="$REPLY"
   if ! session_info=$(curl -fsS -H "$AUTH_HEADER" -X POST "$BASE_URL/api/cli/uploads/$id?size=$size&partSize=$TRANSFER_PART_SIZE&format=tsv"); then
     STATUS='Could not start the parallel upload.'
-    return
+    return 1
   fi
   IFS=$'\t' read -r session part_size part_count <<< "$session_info"
   if [[ -z "$session" || "$part_count" != <-> ]]; then
     STATUS='Server returned an invalid upload session.'
-    return
+    return 1
   fi
-  state_dir=$(mktemp -d "${TMPDIR:-/tmp}/tunnelpane-upload.XXXXXX") || { STATUS='Could not create transfer workspace.'; return; }
+  state_dir=$(mktemp -d "${TMPDIR:-/tmp}/tunnelpane-upload.XXXXXX") || { STATUS='Could not create transfer workspace.'; return 1; }
   worker_count=$TRANSFER_WORKERS
   (( worker_count > part_count )) && worker_count=$part_count
   WORKER_PIDS=()
@@ -528,14 +531,83 @@ upload_selected() {
   if (( rc == 130 )); then
     curl -fsS -o /dev/null -H "$AUTH_HEADER" -X DELETE "$BASE_URL/api/cli/uploads/$session" 2>/dev/null
     STATUS='Upload cancelled.'
+    rc=130
   elif (( rc == 0 )) && curl -fsS -o /dev/null -H "$AUTH_HEADER" -X POST "$BASE_URL/api/cli/uploads/$session/finish"; then
     STATUS="Uploaded $name with $worker_count workers."
     load_server >/dev/null 2>&1 || true
   else
     curl -fsS -o /dev/null -H "$AUTH_HEADER" -X DELETE "$BASE_URL/api/cli/uploads/$session" 2>/dev/null
     STATUS='Parallel upload failed.'
+    rc=1
   fi
   command rm -rf -- "$state_dir"
+  (( rc == 0 ))
+}
+
+upload_selected() {
+  local source_path name target_path root_target item relative count=0 total=0
+  if [[ "$ACTIVE_PANE" != local || $LOCAL_SELECTED -le 0 ]]; then
+    STATUS='Select a local file or folder to upload.'
+    return
+  fi
+  source_path="${LOCAL_PATHS[$LOCAL_SELECTED]}"
+  name="${source_path:t}"
+  if [[ "$name" == .* ]]; then STATUS='Hidden items cannot be uploaded.'; return; fi
+  target_path="${SERVER_DIR:+$SERVER_DIR/}$name"
+  if [[ "${LOCAL_TYPES[$LOCAL_SELECTED]}" == file ]]; then
+    confirm_action "Upload \"$name\"?" || { STATUS='Upload cancelled.'; return; }
+    upload_file "$source_path" "$target_path" "$name"
+    return
+  fi
+
+  confirm_action "Upload folder \"$name\" recursively?" || { STATUS='Upload cancelled.'; return; }
+  root_target="$target_path"
+  create_server_folder_path "$root_target" || { STATUS='Could not create the server folder.'; return; }
+  for item in "$source_path"/**/*(.DN); do
+    relative="${item#$source_path/}"
+    [[ "$relative" == .* || "$relative" == */.* ]] && continue
+    (( total++ ))
+  done
+  for item in "$source_path"/**/*(/DN); do
+    relative="${item#$source_path/}"
+    [[ "$relative" == .* || "$relative" == */.* ]] && continue
+    create_server_folder_path "$root_target/$relative" || { STATUS="Could not create $relative."; return; }
+  done
+  for item in "$source_path"/**/*(.DN); do
+    relative="${item#$source_path/}"
+    [[ "$relative" == .* || "$relative" == */.* ]] && continue
+    (( count++ ))
+    STATUS="Folder upload $count/$total: $relative"
+    upload_file "$item" "$root_target/$relative" "$relative" || return
+  done
+  load_server >/dev/null 2>&1 || true
+  STATUS="Uploaded folder $name ($count files)."
+}
+
+read_folder_name() {
+  local prompt=' Folder name: '
+  terminal_size
+  printf '\r\e[K%s%s%s\e[?25h' "$C_BOLD" "$C_SERVER" "$prompt"
+  IFS= read -r REPLY <&3
+  printf '\e[?25l'
+}
+
+create_folder() {
+  local name target
+  STATUS="Create folder in ${ACTIVE_PANE:u}."
+  show_panes
+  read_folder_name
+  name="$REPLY"
+  if [[ -z "$name" || "$name" == .* || "$name" == */* || "$name" == *\\* || "$name" == '.' || "$name" == '..' ]]; then
+    STATUS='Folder name is invalid.'
+    return
+  fi
+  if [[ "$ACTIVE_PANE" == local ]]; then
+    if command mkdir -- "$LOCAL_DIR/$name" 2>/dev/null; then load_local; STATUS="Created local folder $name."; else STATUS='Could not create local folder.'; fi
+  else
+    target="${SERVER_DIR:+$SERVER_DIR/}$name"
+    if create_server_folder_path "$target"; then load_server; STATUS="Created server folder $name."; else STATUS='Could not create server folder.'; fi
+  fi
 }
 
 download_selected() {
@@ -614,8 +686,8 @@ download_selected() {
 
 delete_selected() {
   local name rc
-  if [[ "$ACTIVE_PANE" != server ]] || ! selected_server_file; then
-    STATUS='Select a server file to delete.'
+  if [[ "$ACTIVE_PANE" != server || $SERVER_SELECTED -le 0 || "${SERVER_TYPES[$SERVER_SELECTED]}" == parent ]]; then
+    STATUS='Select a server file or folder to delete.'
     return
   fi
   name="${SERVER_NAMES[$SERVER_SELECTED]}"
@@ -680,12 +752,24 @@ while true; do
         LOCAL_OFFSET=1
         load_local
         STATUS="Opened $LOCAL_DIR."
+      elif [[ "$ACTIVE_PANE" == server && $SERVER_SELECTED -gt 0 && "${SERVER_TYPES[$SERVER_SELECTED]}" == parent ]]; then
+        if [[ "$SERVER_DIR" == */* ]]; then SERVER_DIR="${SERVER_DIR:h}"; else SERVER_DIR=''; fi
+        SERVER_SELECTED=1 SERVER_OFFSET=1
+        load_server
+        STATUS="Opened server /${SERVER_DIR}."
+      elif [[ "$ACTIVE_PANE" == server && $SERVER_SELECTED -gt 0 && "${SERVER_TYPES[$SERVER_SELECTED]}" == dir ]]; then
+        name="${SERVER_NAMES[$SERVER_SELECTED]%/}"
+        SERVER_DIR="${SERVER_DIR:+$SERVER_DIR/}$name"
+        SERVER_SELECTED=1 SERVER_OFFSET=1
+        load_server
+        STATUS="Opened server /$SERVER_DIR."
       else
-        STATUS='Enter opens folders in the local pane.'
+        STATUS='Enter opens the selected folder.'
       fi
       ;;
     u) upload_selected ;;
     d) download_selected ;;
+    m) create_folder ;;
     x) delete_selected ;;
     r)
       load_local

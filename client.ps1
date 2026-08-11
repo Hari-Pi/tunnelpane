@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 $BaseUrl = if ($env:TUNNELPANE_URL) { $env:TUNNELPANE_URL.TrimEnd("/") } else { "__TUNNELPANE_URL__" }
 $LocalDirectory = (Get-Location).Path
+$ServerDirectory = ""
 $ActivePane = "local"
 $LocalSelected = 0
 $ServerSelected = 0
@@ -10,7 +11,7 @@ $Status = "Ready."
 $TransferWorkers = if ($env:TUNNELPANE_TRANSFERS) { [int]$env:TUNNELPANE_TRANSFERS } else { 4 }
 if ($TransferWorkers -lt 1) { $TransferWorkers = 4 }
 if ($TransferWorkers -gt 8) { $TransferWorkers = 8 }
-$TransferPartSize = 8MB
+$TransferPartSize = 16MB
 
 function Get-FileId([string]$Name) {
     $value = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Name))
@@ -50,8 +51,13 @@ function Get-LocalItems {
 }
 
 function Get-ServerItems {
-    $result = Invoke-RestMethod -Uri "$BaseUrl/api/cli/files" -Headers $Headers -Method Get
-    return @($result.files)
+    $uri = "$BaseUrl/api/cli/files?format=json3"
+    if ($ServerDirectory) { $uri += "&path=$(Get-FileId $ServerDirectory)" }
+    $result = Invoke-RestMethod -Uri $uri -Headers $Headers -Method Get
+    $items = @()
+    if ($ServerDirectory) { $items += [pscustomobject]@{ id = ".."; name = ".."; type = "parent"; size = 0; sizeLabel = "-"; modified = "" } }
+    $items += @($result.files)
+    return @($items)
 }
 
 function Fit-Text([string]$Value, [int]$Width) {
@@ -151,7 +157,8 @@ function Show-Panes {
     $serverAccent = if ($ActivePane -eq "server") { [ConsoleColor]::Yellow } else { [ConsoleColor]::DarkGray }
     Write-Host -NoNewline (New-TitleBorder "LOCAL  $($LocalItems.Count) items" $paneWidth) -ForegroundColor $localAccent
     Write-Host -NoNewline "  "
-    Write-Host (New-TitleBorder "SERVER  $($ServerItems.Count) files" $paneWidth) -ForegroundColor $serverAccent
+    $serverTitle = if ($ServerDirectory) { $ServerDirectory } else { "/" }
+    Write-Host (New-TitleBorder "SERVER  $serverTitle" $paneWidth) -ForegroundColor $serverAccent
 
     $leftHeader = New-ItemRow "NAME" "SIZE" "" $inner " " $false
     $rightHeaderRow = New-ItemRow "NAME" "SIZE" "MODIFIED" $inner " " $showDate
@@ -180,20 +187,21 @@ function Show-Panes {
             $marker = if ($si -eq $ServerSelected) { if ($ActivePane -eq "server") { ">" } else { "*" } } else { " " }
             $rightSelected = $si -eq $ServerSelected
             $modified = if ($showDate) { ([string]$ServerItems[$si].modified).Replace("T", " ").Substring(0, [Math]::Min(16, ([string]$ServerItems[$si].modified).Length)) } else { "" }
-            $right = New-ItemRow $ServerItems[$si].name $ServerItems[$si].sizeLabel $modified $inner $marker $showDate
+            $serverName = if ($ServerItems[$si].type -eq "dir") { $ServerItems[$si].name + "/" } else { $ServerItems[$si].name }
+            $right = New-ItemRow $serverName $ServerItems[$si].sizeLabel $modified $inner $marker $showDate
         } elseif ($ServerItems.Count -eq 0 -and $row -eq 0) {
             $right = Fit-Text "  No files on server" $inner
         }
         Write-PaneRow $left $leftSelected ($ActivePane -eq "local") $isDirectory $localAccent
         Write-Host -NoNewline "  "
-        Write-PaneRow $right $rightSelected ($ActivePane -eq "server") $false $serverAccent
+        Write-PaneRow $right $rightSelected ($ActivePane -eq "server") ($si -lt $ServerItems.Count -and $ServerItems[$si].type -eq "dir") $serverAccent
         Write-Host
     }
 
     $bottom = "+-" + ("-" * ($paneWidth - 4)) + "-+"
     Write-Host "$bottom  $bottom" -ForegroundColor DarkGray
     Write-Key "TAB"; Write-Host -NoNewline " pane   "; Write-Key "J/K"; Write-Host -NoNewline " move   "; Write-Key "ENTER"; Write-Host -NoNewline " open   "; Write-Key "U"; Write-Host -NoNewline " upload   "; Write-Key "D"; Write-Host " download"
-    Write-Key "X"; Write-Host -NoNewline " delete  "; Write-Key "R"; Write-Host -NoNewline " refresh "; Write-Key "ESC"; Write-Host -NoNewline " cancel  "; Write-Key "Q"; Write-Host " quit"
+    Write-Key "M"; Write-Host -NoNewline " mkdir   "; Write-Key "X"; Write-Host -NoNewline " delete  "; Write-Key "R"; Write-Host -NoNewline " refresh "; Write-Key "ESC"; Write-Host -NoNewline " cancel  "; Write-Key "Q"; Write-Host " quit"
 
     $statusColor = [ConsoleColor]::Cyan
     $statusLabel = " READY "
@@ -276,20 +284,18 @@ function Dispose-ActiveTransfers($Active) {
     }
 }
 
-function Upload-Selected {
-    if ($ActivePane -ne "local" -or $LocalSelected -lt 0 -or $LocalItems[$LocalSelected].IsDirectory) {
-        $script:Status = "Select a file in the local pane to upload."
-        return
-    }
-    $item = $LocalItems[$LocalSelected]
-    if ($item.Name.StartsWith(".")) { $script:Status = "Server filenames cannot begin with a dot."; return }
-    if (-not (Confirm-Action "Upload `"$($item.Name)`"?")) { $script:Status = "Upload cancelled."; return }
+function New-ServerFolder([string]$Path) {
+    $id = Get-FileId $Path
+    Invoke-RestMethod -Uri "$BaseUrl/api/cli/folders/$id" -Headers $Headers -Method Post | Out-Null
+}
+
+function Upload-File($item, [string]$TargetPath) {
     $session = $null
     $active = [Collections.ArrayList]::new()
     $cancellation = [Threading.CancellationTokenSource]::new()
     $finished = $false
     try {
-        $id = Get-FileId $item.Name
+        $id = Get-FileId $TargetPath
         $session = Invoke-RestMethod -Uri "$BaseUrl/api/cli/uploads/${id}?size=$($item.Length)&partSize=$TransferPartSize" -Headers $Headers -Method Post
         $workers = [Math]::Min($TransferWorkers, [int]$session.partCount)
         $nextPart = 0
@@ -354,8 +360,76 @@ function Upload-Selected {
     }
 }
 
+function Upload-Selected {
+    if ($ActivePane -ne "local" -or $LocalSelected -lt 0) {
+        $script:Status = "Select a local file or folder to upload."
+        return
+    }
+    $item = $LocalItems[$LocalSelected]
+    $name = $item.Name.TrimEnd("/")
+    if ($name.StartsWith(".")) { $script:Status = "Hidden items cannot be uploaded."; return }
+    $target = if ($ServerDirectory) { "$ServerDirectory/$name" } else { $name }
+    if (-not $item.IsDirectory) {
+        if (-not (Confirm-Action "Upload `"$name`"?")) { $script:Status = "Upload cancelled."; return }
+        Upload-File $item $target
+        return
+    }
+
+    if ($name -eq "..") { $script:Status = "Select a folder, not its parent entry."; return }
+    if (-not (Confirm-Action "Upload folder `"$name`" recursively?")) { $script:Status = "Upload cancelled."; return }
+    try {
+        New-ServerFolder $target
+        $directories = @(Get-ChildItem -LiteralPath $item.FullName -Directory -Recurse -Force | Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::Hidden) })
+        foreach ($directory in $directories) {
+            $relative = $directory.FullName.Substring($item.FullName.Length).TrimStart("\", "/").Replace("\", "/")
+            if ($relative.Split("/") | Where-Object { $_.StartsWith(".") }) { continue }
+            New-ServerFolder "$target/$relative"
+        }
+        $files = @(Get-ChildItem -LiteralPath $item.FullName -File -Recurse -Force | Where-Object { -not ($_.Attributes -band [IO.FileAttributes]::Hidden) })
+        $count = 0
+        foreach ($file in $files) {
+            $relative = $file.FullName.Substring($item.FullName.Length).TrimStart("\", "/").Replace("\", "/")
+            if ($relative.Split("/") | Where-Object { $_.StartsWith(".") }) { continue }
+            $count++
+            $uploadItem = [pscustomobject]@{ Name = $relative; FullName = $file.FullName; Length = [long]$file.Length }
+            $script:Status = "Folder upload $count/$($files.Count): $relative"
+            Upload-File $uploadItem "$target/$relative"
+            if ($Status -match "cancelled|failed") { return }
+        }
+        $script:ServerItems = @(Get-ServerItems); Clamp-Selections
+        $script:Status = "Uploaded folder $name ($count files)."
+    } catch {
+        $script:Status = "Folder upload failed: $($_.Exception.Message)"
+    }
+}
+
+function New-Folder {
+    $script:Status = "Create folder in $($ActivePane.ToUpperInvariant())."
+    Show-Panes
+    try { [Console]::CursorVisible = $true } catch {}
+    $name = Read-Host " Folder name"
+    try { [Console]::CursorVisible = $false } catch {}
+    if ([string]::IsNullOrWhiteSpace($name) -or $name.StartsWith(".") -or $name.Contains("/") -or $name.Contains("\") -or $name -in @(".", "..")) {
+        $script:Status = "Folder name is invalid."
+        return
+    }
+    try {
+        if ($ActivePane -eq "local") {
+            New-Item -ItemType Directory -Path (Join-Path $LocalDirectory $name) -ErrorAction Stop | Out-Null
+            $script:LocalItems = @(Get-LocalItems)
+            $script:Status = "Created local folder $name."
+        } else {
+            $target = if ($ServerDirectory) { "$ServerDirectory/$name" } else { $name }
+            New-ServerFolder $target
+            $script:ServerItems = @(Get-ServerItems)
+            $script:Status = "Created server folder $name."
+        }
+        Clamp-Selections
+    } catch { $script:Status = "Could not create folder: $($_.Exception.Message)" }
+}
+
 function Download-Selected {
-    if ($ActivePane -ne "server" -or $ServerSelected -lt 0) {
+    if ($ActivePane -ne "server" -or $ServerSelected -lt 0 -or $ServerItems[$ServerSelected].type -ne "file") {
         $script:Status = "Select a file in the server pane to download."
         return
     }
@@ -440,8 +514,8 @@ function Download-Selected {
 }
 
 function Delete-Selected {
-    if ($ActivePane -ne "server" -or $ServerSelected -lt 0) {
-        $script:Status = "Select a file in the server pane to delete."
+    if ($ActivePane -ne "server" -or $ServerSelected -lt 0 -or $ServerItems[$ServerSelected].type -eq "parent") {
+        $script:Status = "Select a file or folder in the server pane to delete."
         return
     }
     $item = $ServerItems[$ServerSelected]
@@ -516,10 +590,21 @@ try {
                     $LocalItems = @(Get-LocalItems)
                     Clamp-Selections
                     $Status = "Opened $LocalDirectory."
-                } else { $Status = "Enter opens folders in the local pane." }
+                } elseif ($ActivePane -eq "server" -and $ServerSelected -ge 0 -and $ServerItems[$ServerSelected].type -eq "parent") {
+                    $ServerDirectory = if ($ServerDirectory.Contains("/")) { $ServerDirectory.Substring(0, $ServerDirectory.LastIndexOf("/")) } else { "" }
+                    $ServerSelected = 0; $ServerOffset = 0
+                    $ServerItems = @(Get-ServerItems); Clamp-Selections
+                    $Status = "Opened server /$ServerDirectory."
+                } elseif ($ActivePane -eq "server" -and $ServerSelected -ge 0 -and $ServerItems[$ServerSelected].type -eq "dir") {
+                    $ServerDirectory = if ($ServerDirectory) { "$ServerDirectory/$($ServerItems[$ServerSelected].name)" } else { $ServerItems[$ServerSelected].name }
+                    $ServerSelected = 0; $ServerOffset = 0
+                    $ServerItems = @(Get-ServerItems); Clamp-Selections
+                    $Status = "Opened server /$ServerDirectory."
+                } else { $Status = "Enter opens the selected folder." }
             }
             "u" { Upload-Selected }
             "d" { Download-Selected }
+            "m" { New-Folder }
             "x" { Delete-Selected }
             "r" {
                 $LocalItems = @(Get-LocalItems)

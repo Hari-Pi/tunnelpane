@@ -34,7 +34,7 @@ try {
   assert.match(zshClient, /terminal_enter/);
   assert.match(zshClient, /print_key 'TAB'/);
   assert.match(zshClient, /monitor_workers/);
-  assert.match(zshClient, /format=tsv2/);
+  assert.match(zshClient, /format=tsv3/);
   assert.match(powershellClient, /Read-Host "Password" -AsSecureString/);
   assert.match(powershellClient, /Read-Host "Username"/);
   assert.match(powershellClient, /TreatControlCAsInput/);
@@ -42,6 +42,7 @@ try {
   assert.match(powershellClient, /Show-TransferProgress/);
   assert.match(powershellClient, /Write-PaneRow/);
   assert.match(powershellClient, /api\/cli\/uploads/);
+  assert.match(powershellClient, /New-ServerFolder/);
 
   let response = await fetch(base + '/hello.txt', { method: 'PUT', headers: { Authorization: auth }, body: 'hello world' });
   assert.equal(response.status, 201);
@@ -80,6 +81,20 @@ try {
   assert.match(tsv2, new RegExp('^' + cliId + '\\t.*\\t12$', 'm'));
   response = await fetch(base + '/api/cli/files/' + cliId, { method: 'DELETE', headers: { Authorization: auth } });
   assert.equal(response.status, 200);
+
+  const folderPath = 'projects/demo';
+  const folderId = Buffer.from(folderPath).toString('base64url');
+  response = await fetch(base + '/api/cli/folders/' + folderId, { method: 'POST', headers: { Authorization: auth } });
+  assert.equal(response.status, 201);
+  const nestedName = folderPath + '/notes.txt';
+  const nestedId = Buffer.from(nestedName).toString('base64url');
+  response = await fetch(base + '/api/cli/files/' + nestedId, { method: 'PUT', headers: { Authorization: auth }, body: 'nested file' });
+  assert.equal(response.status, 201);
+  response = await fetch(base + '/api/cli/files?format=json3&path=' + Buffer.from('projects').toString('base64url'), { headers: { Authorization: auth } });
+  const directoryListing = await response.json();
+  assert.deepEqual(directoryListing.files.map(item => [item.name, item.type]), [['demo', 'dir']]);
+  response = await fetch(base + '/projects/demo/notes.txt', { headers: { Authorization: auth } });
+  assert.equal(await response.text(), 'nested file');
 
   const parallelName = 'parallel upload.bin';
   const parallelId = Buffer.from(parallelName).toString('base64url');

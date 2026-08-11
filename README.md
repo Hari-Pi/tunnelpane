@@ -6,11 +6,12 @@ The service listens on loopback by default. It does not expose SSH or require in
 
 ## Features
 
-- Browser upload, download, search, sorting, and deletion
+- Browser folder navigation, creation, upload, download, search, sorting, and deletion
 - Resumable chunked browser uploads
 - Responsive full-screen terminal interface with color-coded panes and aligned file metadata
 - Hosted zsh and PowerShell launchers with no embedded credentials
 - Parallel chunked uploads and range downloads with configurable worker count
+- Recursive folder uploads that preserve nested and empty directories
 - Responsive transfer progress with percentage, verified bytes, throughput, active workers, and persistent cancel hints
 - Cancellable transfers and confirmation before file operations
 - HTTP range requests for resumable downloads
@@ -89,6 +90,7 @@ irm https://files.example.com/client.ps1 | iex
 | `Enter` | Open a local folder |
 | `u` | Upload the selected local file |
 | `d` | Download the selected server file |
+| `m` | Create a folder in the active pane |
 | `x` | Delete the selected server file |
 | `r` | Refresh both panes |
 | `Esc`, `Ctrl+C` | Cancel without closing |
@@ -102,14 +104,14 @@ curl -u 'username:password' -O https://files.example.com/report.pdf
 wget --user=username --password=password https://files.example.com/report.pdf
 ```
 
-Direct single-request uploads are limited to 95 MB by default. The browser client uploads larger files in chunks.
+Direct single-request uploads are limited to 95 MB by default. The browser and terminal clients upload larger files in 16 MB chunks, with the practical limit determined by available server storage.
 
 ## Security
 
 - Keep `LISTEN_ADDRESS=127.0.0.1` unless you intentionally want LAN access.
 - Use the service only behind HTTPS. Basic authentication is not safe over plaintext HTTP.
 - Do not commit `.env`; it is ignored by Git.
-- The server rejects hidden filenames, path separators, and oversized names.
+- The server rejects hidden path segments, traversal attempts, and oversized names.
 - Cloudflare configuration and access policies are intentionally outside this repository.
 
 ## Test
