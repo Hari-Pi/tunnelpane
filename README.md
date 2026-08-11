@@ -6,9 +6,9 @@ The service listens on loopback by default. It does not expose SSH or require in
 
 ## Demo
 
-[![TunnelPane terminal client demo](docs/tunnelpane-preview.gif)](https://github.com/Hari-Pi/tunnelpane/blob/main/docs/tunnelpane-demo.mp4?raw=true)
+[![TunnelPane terminal client demo](docs/tunnelpane-preview.gif)](https://hari-pi.github.io/tunnelpane/demo.html)
 
-[Watch the full terminal demo](https://github.com/Hari-Pi/tunnelpane/blob/main/docs/tunnelpane-demo.mp4?raw=true) showing a rejected sign-in, masked-password authentication, pane navigation, parallel transfers, recursive folder upload, and server-folder browsing.
+[Watch the full terminal demo](https://hari-pi.github.io/tunnelpane/demo.html) showing a rejected sign-in, masked-password authentication, pane navigation, parallel transfers, recursive folder upload, and server-folder browsing.
 
 ## Features
 
