@@ -60,10 +60,10 @@ const HTML = String.raw`<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>TunnelPane</title>
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="alternate icon" href="/favicon.ico" type="image/png">
-  <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png">
-  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="icon" href="/favicon.svg?v=2" type="image/svg+xml">
+  <link rel="alternate icon" href="/favicon.ico?v=2" type="image/png">
+  <link rel="icon" href="/favicon-32.png?v=2" sizes="32x32" type="image/png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=2">
   <style>
     :root{color-scheme:light;--ink:#202522;--muted:#69716c;--line:#d9dedb;--soft:#f4f6f5;--green:#16835b;--green-dark:#0c6544;--blue:#2167c5;--red:#b52d3a;--white:#fff}
     *{box-sizing:border-box}body{margin:0;background:var(--white);color:var(--ink);font:15px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0}
