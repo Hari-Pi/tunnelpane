@@ -64,28 +64,43 @@ const HTML = String.raw`<!doctype html>
   <link rel="alternate icon" href="/favicon.ico?v=2" type="image/png">
   <link rel="icon" href="/favicon-32.png?v=2" sizes="32x32" type="image/png">
   <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=2">
+  <script>
+    try {
+      var savedTheme = localStorage.getItem('tunnelpane-theme');
+      var preferredTheme = savedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      document.documentElement.dataset.theme = preferredTheme;
+    } catch (_) {
+      document.documentElement.dataset.theme = 'light';
+    }
+  </script>
   <style>
-    :root{color-scheme:light;--ink:#202522;--muted:#69716c;--line:#d9dedb;--soft:#f4f6f5;--green:#16835b;--green-dark:#0c6544;--blue:#2167c5;--red:#b52d3a;--white:#fff}
-    *{box-sizing:border-box}body{margin:0;background:var(--white);color:var(--ink);font:15px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0}
+    :root{color-scheme:light;--bg:#fff;--surface:#fff;--surface-2:#f4f6f5;--upload:#f7faf8;--upload-drag:#eef8f3;--ink:#202522;--muted:#69716c;--line:#d9dedb;--green:#16835b;--green-dark:#0c6544;--blue:#2167c5;--red:#b52d3a;--button:#fff;--button-hover:#f4f6f5;--danger-soft:#fff3f4;--progress-bg:#dde4df;--notice:#242a26;--notice-error:#8f2430;--shadow:#0003;--focus:#16835b55}
+    :root[data-theme=dark]{color-scheme:dark;--bg:#101411;--surface:#151b17;--surface-2:#202820;--upload:#151f19;--upload-drag:#193224;--ink:#eef4ef;--muted:#9ba8a1;--line:#334139;--green:#43c589;--green-dark:#31ad75;--blue:#8bbcff;--red:#ff7b88;--button:#1c251f;--button-hover:#243128;--danger-soft:#3a2024;--progress-bg:#29362f;--notice:#edf3ee;--notice-error:#ffdee2;--shadow:#0008;--focus:#43c58966}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;letter-spacing:0}
     button,input,select{font:inherit;letter-spacing:0}button{cursor:pointer}.shell{width:min(1120px,calc(100% - 32px));margin:0 auto}
-    header{border-bottom:1px solid var(--line);background:#fff}.header-row{min-height:68px;display:flex;align-items:center;justify-content:space-between;gap:20px}
-    .brand{font-size:21px;font-weight:750}.brand span{color:var(--green)}.storage{font-size:13px;color:var(--muted);text-align:right}
-    main{padding:28px 0 48px}.upload-band{border:1px dashed #9daf9f;background:#f7faf8;padding:24px;text-align:center;border-radius:6px;transition:.15s}
-    .upload-band.drag{border-color:var(--green);background:#eef8f3}.upload-band strong{display:block;font-size:17px;margin-bottom:4px}.upload-band p{margin:0 0 15px;color:var(--muted)}
+    input,select{background:var(--surface);color:var(--ink)}button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+    header{border-bottom:1px solid var(--line);background:var(--surface)}.header-row{min-height:68px;display:flex;align-items:center;justify-content:space-between;gap:20px}
+    .brand{font-size:21px;font-weight:750}.brand span{color:var(--green)}.header-tools{display:flex;align-items:center;gap:14px}.storage{font-size:13px;color:var(--muted);text-align:right}
+    .theme-toggle{position:relative;width:38px;height:38px;border:1px solid var(--line);border-radius:19px;background:var(--button);color:var(--ink);flex:0 0 auto}
+    .theme-toggle:hover{background:var(--button-hover)}.theme-toggle:before{content:"";position:absolute;left:10px;top:9px;width:16px;height:16px;border-radius:50%;background:var(--ink);box-shadow:6px 5px 0 var(--button)}
+    :root[data-theme=dark] .theme-toggle:before{left:9px;top:9px;background:transparent;border:2px solid var(--ink);box-shadow:8px 0 0 -3px var(--ink),-8px 0 0 -3px var(--ink),0 8px 0 -3px var(--ink),0 -8px 0 -3px var(--ink)}
+    :root[data-theme=dark] .theme-toggle:after{content:"";position:absolute;left:15px;top:15px;width:8px;height:8px;border-radius:50%;background:var(--ink)}
+    main{padding:28px 0 48px}.upload-band{border:1px dashed #9daf9f;background:var(--upload);padding:24px;text-align:center;border-radius:6px;transition:.15s}
+    .upload-band.drag{border-color:var(--green);background:var(--upload-drag)}.upload-band strong{display:block;font-size:17px;margin-bottom:4px}.upload-band p{margin:0 0 15px;color:var(--muted)}
     .primary,.secondary,.danger{border-radius:5px;padding:9px 14px;font-weight:650;border:1px solid transparent}.primary{background:var(--green);color:#fff}.primary:hover{background:var(--green-dark)}
-    .secondary{background:#fff;border-color:var(--line);color:var(--ink)}.secondary:hover{background:var(--soft)}.danger{background:#fff;border-color:#e5b8bd;color:var(--red)}.danger:hover{background:#fff3f4}
+    .secondary{background:var(--button);border-color:var(--line);color:var(--ink)}.secondary:hover{background:var(--button-hover)}.secondary:disabled{cursor:not-allowed;opacity:.48}.danger{background:var(--button);border-color:#e5b8bd;color:var(--red)}.danger:hover{background:var(--danger-soft)}
     .queue{margin-top:14px;text-align:left}.job{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px 16px;padding:10px 0;border-top:1px solid var(--line)}
-    .job-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.job-status{color:var(--muted);font-size:13px}.progress{height:5px;background:#dde4df;grid-column:1/-1;border-radius:3px;overflow:hidden}.progress span{display:block;height:100%;background:var(--green);width:0}
-    .toolbar{display:flex;align-items:center;gap:10px;margin:26px 0 12px}.search{flex:1;min-width:0;border:1px solid var(--line);border-radius:5px;padding:9px 11px}.sort{border:1px solid var(--line);border-radius:5px;padding:9px 32px 9px 10px;background:#fff}
-    .table-wrap{border:1px solid var(--line);border-radius:6px;overflow:hidden}table{width:100%;border-collapse:collapse;table-layout:fixed}th{background:var(--soft);color:var(--muted);font-size:12px;text-transform:uppercase;text-align:left;padding:10px 12px}td{padding:12px;border-top:1px solid var(--line);vertical-align:middle}
+    .job-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.job-status{color:var(--muted);font-size:13px}.progress{height:5px;background:var(--progress-bg);grid-column:1/-1;border-radius:3px;overflow:hidden}.progress span{display:block;height:100%;background:var(--green);width:0}
+    .toolbar{display:flex;align-items:center;gap:10px;margin:26px 0 12px}.search{flex:1;min-width:0;border:1px solid var(--line);border-radius:5px;padding:9px 11px}.sort{border:1px solid var(--line);border-radius:5px;padding:9px 32px 9px 10px;background:var(--surface)}
+    .table-wrap{border:1px solid var(--line);border-radius:6px;overflow:hidden;background:var(--surface)}table{width:100%;border-collapse:collapse;table-layout:fixed}th{background:var(--surface-2);color:var(--muted);font-size:12px;text-transform:uppercase;text-align:left;padding:10px 12px}td{padding:12px;border-top:1px solid var(--line);vertical-align:middle}
     th:nth-child(1){width:52%}th:nth-child(2){width:14%}th:nth-child(3){width:18%}th:nth-child(4){width:16%}.file-name{font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.file-name a{color:var(--ink);text-decoration:none}.file-name a:hover{color:var(--blue);text-decoration:underline}
     .actions{display:flex;justify-content:flex-end;gap:7px}.icon-action{border:0;background:transparent;color:var(--blue);padding:5px}.icon-action.delete{color:var(--red)}.empty{padding:42px 20px;text-align:center;color:var(--muted)}
-    .notice{position:fixed;right:20px;bottom:20px;max-width:min(390px,calc(100% - 40px));background:#242a26;color:#fff;padding:11px 14px;border-radius:5px;box-shadow:0 8px 28px #0003;display:none}.notice.error{background:#8f2430}
+    .notice{position:fixed;right:20px;bottom:20px;max-width:min(390px,calc(100% - 40px));background:var(--notice);color:var(--surface);padding:11px 14px;border-radius:5px;box-shadow:0 8px 28px var(--shadow);display:none}.notice.error{background:var(--notice-error);color:var(--surface)}
     @media(max-width:720px){.shell{width:min(100% - 20px,1120px)}.header-row{min-height:60px}.storage{display:none}main{padding-top:18px}.upload-band{padding:20px 14px}.toolbar{flex-wrap:wrap}.search{flex-basis:100%}.sort{flex:1}.table-wrap{border-left:0;border-right:0;border-radius:0}th:nth-child(2),td:nth-child(2),th:nth-child(3),td:nth-child(3){display:none}th:nth-child(1){width:58%}th:nth-child(4){width:42%}td{padding:11px 8px}.actions{gap:2px}.icon-action{padding:6px 4px;font-size:13px}}
   </style>
 </head>
 <body>
-  <header><div class="shell header-row"><div class="brand">Tunnel<span>Pane</span></div><div class="storage" id="storage">Checking storage...</div></div></header>
+  <header><div class="shell header-row"><div class="brand">Tunnel<span>Pane</span></div><div class="header-tools"><div class="storage" id="storage">Checking storage...</div><button class="theme-toggle" id="themeToggle" type="button" aria-label="Switch theme" title="Switch theme"></button></div></div></header>
   <main class="shell">
     <section class="upload-band" id="dropZone">
       <strong>Upload files</strong><p>Drop files here or choose files or a folder from your device.</p>
@@ -112,6 +127,19 @@ const HTML = String.raw`<!doctype html>
     var fileBody = document.getElementById('files');
     var empty = document.getElementById('empty');
     var notice = document.getElementById('notice');
+    var themeToggle = document.getElementById('themeToggle');
+
+    function applyTheme(theme) {
+      document.documentElement.dataset.theme = theme;
+      themeToggle.setAttribute('aria-label', theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
+      themeToggle.title = theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode';
+    }
+    themeToggle.onclick = function() {
+      var next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+      try { localStorage.setItem('tunnelpane-theme', next); } catch (_) {}
+      applyTheme(next);
+    };
+    applyTheme(document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light');
 
     function formatBytes(value) {
       if (!value) return '0 B';

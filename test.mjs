@@ -31,6 +31,13 @@ try {
   assert.equal((await fetch(base + '/favicon.ico')).status, 200);
   const zshClient = await (await fetch(base + '/client.zsh')).text();
   const powershellClient = await (await fetch(base + '/client.ps1')).text();
+  const browserResponse = await fetch(base + '/', { headers: { Authorization: auth } });
+  const browserHtml = await browserResponse.text();
+  assert.equal(browserResponse.status, 200);
+  assert.match(browserHtml, /id="themeToggle"/);
+  assert.match(browserHtml, /tunnelpane-theme/);
+  assert.match(browserHtml, /dataset\.theme = preferredTheme/);
+  assert.match(browserHtml, /:root\[data-theme=dark\]/);
   assert.match(zshClient, new RegExp(base.replaceAll('.', '\\.')));
   assert.match(powershellClient, new RegExp(base.replaceAll('.', '\\.')));
   assert.doesNotMatch(zshClient, /__TUNNELPANE_URL__/);
