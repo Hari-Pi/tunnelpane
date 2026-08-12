@@ -24,6 +24,11 @@ try {
   });
   assert.equal((await fetch(base + '/')).status, 401);
   assert.equal((await fetch(base + '/healthz')).status, 200);
+  const favicon = await fetch(base + '/favicon.svg');
+  assert.equal(favicon.status, 200);
+  assert.equal(favicon.headers.get('content-type'), 'image/svg+xml');
+  assert.match(await favicon.text(), /viewBox="0 0 64 64"/);
+  assert.equal((await fetch(base + '/favicon.ico')).status, 200);
   const zshClient = await (await fetch(base + '/client.zsh')).text();
   const powershellClient = await (await fetch(base + '/client.ps1')).text();
   assert.match(zshClient, new RegExp(base.replaceAll('.', '\\.')));
