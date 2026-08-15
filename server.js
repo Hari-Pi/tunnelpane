@@ -14,6 +14,7 @@ const AUTH_PASSWORD_HASH = process.env.AUTH_PASSWORD_HASH || '';
 const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/+$/, '');
 const MAX_SINGLE_UPLOAD = Number(process.env.MAX_SINGLE_UPLOAD || 95 * 1024 * 1024);
 const MAX_CHUNK_SIZE = Number(process.env.MAX_CHUNK_SIZE || 16 * 1024 * 1024);
+const WRITE_BATCH_SIZE = Number(process.env.WRITE_BATCH_SIZE || 4 * 1024 * 1024);
 const FAILED_AUTH_LIMIT = 10;
 const FAILED_AUTH_WINDOW_MS = 15 * 60 * 1000;
 const failedAuth = new Map();
@@ -120,6 +121,7 @@ const HTML = String.raw`<!doctype html>
   <script>
     var files = [], currentPath = '';
     var chunkSize = 8 * 1024 * 1024;
+    var uploadConcurrency = 4;
     var fileInput = document.getElementById('fileInput');
     var folderInput = document.getElementById('folderInput');
     var dropZone = document.getElementById('dropZone');
@@ -194,21 +196,39 @@ const HTML = String.raw`<!doctype html>
       var progress=document.createElement('div');progress.className='progress';var fill=document.createElement('span');progress.appendChild(fill);
       job.append(name,status,progress);queue.appendChild(job);return {job:job,status:status,fill:fill};
     }
+    function toFileId(value){return btoa(unescape(encodeURIComponent(value))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')}
+    async function failure(response,fallback){var body=await response.json().catch(function(){return {}});return new Error(body.error||fallback)}
     async function upload(file) {
       var ui=createJob(file);
+      var sessionId='';
       try {
         var relative=file.webkitRelativePath||file.name;var target=currentPath?currentPath+'/'+relative:relative;
-        var session=await api('/api/uploads',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:target,size:file.size})});
-        var offset=session.offset;
-        while(offset<file.size){
-          var end=Math.min(offset+chunkSize,file.size);var chunk=file.slice(offset,end);
-          var response=await fetch('/api/uploads/'+session.id,{method:'PATCH',headers:{'Upload-Offset':String(offset),'Content-Type':'application/octet-stream'},body:chunk});
-          var result=await response.json().catch(function(){return {error:'Upload failed'}});if(!response.ok)throw new Error(result.error||'Upload failed');
-          offset=result.offset;var percent=file.size?Math.round(offset/file.size*100):100;ui.fill.style.width=percent+'%';ui.status.textContent=percent+'%';
+        var started=await fetch('/api/cli/uploads/'+toFileId(target)+'?size='+file.size+'&partSize='+chunkSize+'&format=tsv',{method:'POST'});
+        if(!started.ok)throw await failure(started,'Could not start upload');
+        var fields=(await started.text()).trim().split('\t');
+        sessionId=fields[0];var partSize=Number(fields[1]);var partCount=Number(fields[2]);
+        var uploaded=0,next=0;
+        async function sendParts(){
+          while(true){
+            var index=next++;
+            if(index>=partCount)return;
+            var from=index*partSize,to=Math.min(from+partSize,file.size);
+            var response=await fetch('/api/cli/uploads/'+sessionId+'/parts/'+index,{method:'PUT',headers:{'Content-Type':'application/octet-stream'},body:file.slice(from,to)});
+            if(!response.ok)throw await failure(response,'Part '+index+' failed');
+            uploaded=uploaded+(to-from);
+            var percent=file.size?Math.round(uploaded/file.size*100):100;ui.fill.style.width=percent+'%';ui.status.textContent=percent+'%';
+          }
         }
-        await api('/api/uploads/'+session.id+'/finish',{method:'POST'});ui.status.textContent='Complete';ui.fill.style.width='100%';
+        var lanes=Math.min(uploadConcurrency,partCount);
+        await Promise.all(Array.from({length:lanes},sendParts));
+        var finished=await fetch('/api/cli/uploads/'+sessionId+'/finish',{method:'POST'});
+        if(!finished.ok)throw await failure(finished,'Could not finish upload');
+        sessionId='';ui.status.textContent='Complete';ui.fill.style.width='100%';
         setTimeout(function(){ui.job.remove()},1800);await refresh();
-      } catch(error){ui.status.textContent=error.message;ui.status.style.color='var(--red)';showNotice('Upload failed: '+error.message,true)}
+      } catch(error){
+        if(sessionId)fetch('/api/cli/uploads/'+sessionId,{method:'DELETE'}).catch(function(){});
+        ui.status.textContent=error.message;ui.status.style.color='var(--red)';showNotice('Upload failed: '+error.message,true);
+      }
     }
     async function uploadAll(list){for(var i=0;i<list.length;i++)await upload(list[i])}
     document.getElementById('chooseButton').onclick=function(){fileInput.click()};
@@ -219,7 +239,7 @@ const HTML = String.raw`<!doctype html>
     ['dragleave','drop'].forEach(function(name){dropZone.addEventListener(name,function(event){event.preventDefault();dropZone.classList.remove('drag')})});
     dropZone.addEventListener('drop',function(event){uploadAll(Array.from(event.dataTransfer.files))});
     document.getElementById('up').onclick=function(){currentPath=currentPath.includes('/')?currentPath.slice(0,currentPath.lastIndexOf('/')):'';refresh()};
-    document.getElementById('newFolder').onclick=async function(){var name=prompt('Folder name');if(!name)return;try{var target=joined(name);var id=btoa(unescape(encodeURIComponent(target))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');await api('/api/cli/folders/'+id,{method:'POST'});await refresh()}catch(error){showNotice(error.message,true)}};
+    document.getElementById('newFolder').onclick=async function(){var name=prompt('Folder name');if(!name)return;try{await api('/api/cli/folders/'+toFileId(joined(name)),{method:'POST'});await refresh()}catch(error){showNotice(error.message,true)}};
     document.getElementById('search').oninput=render;document.getElementById('sort').onchange=render;document.getElementById('refresh').onclick=refresh;
     refresh();
   </script>
@@ -228,6 +248,14 @@ const HTML = String.raw`<!doctype html>
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+const AUTH_USER_DIGEST = Buffer.from(sha256(AUTH_USER));
+const AUTH_PASSWORD_DIGEST = Buffer.from(AUTH_PASSWORD_HASH.toLowerCase());
+
+function pruneFailedAuth() {
+  const now = Date.now();
+  for (const [ip, state] of failedAuth) if (state.until <= now) failedAuth.delete(ip);
 }
 
 function json(res, status, payload, headers = {}) {
@@ -253,8 +281,8 @@ function isAuthorized(req) {
   if (separator < 0) return false;
   const user = decoded.slice(0, separator);
   const passwordHash = sha256(decoded.slice(separator + 1));
-  const userOk = crypto.timingSafeEqual(Buffer.from(sha256(user)), Buffer.from(sha256(AUTH_USER)));
-  const passOk = crypto.timingSafeEqual(Buffer.from(passwordHash), Buffer.from(AUTH_PASSWORD_HASH.toLowerCase()));
+  const userOk = crypto.timingSafeEqual(Buffer.from(sha256(user)), AUTH_USER_DIGEST);
+  const passOk = crypto.timingSafeEqual(Buffer.from(passwordHash), AUTH_PASSWORD_DIGEST);
   if (userOk && passOk) { failedAuth.delete(ip); return true; }
 
   const current = state && state.until > Date.now() ? state : { count: 0, until: Date.now() + FAILED_AUTH_WINDOW_MS };
@@ -367,22 +395,47 @@ async function writeRequest(req, target, flags, maxBytes) {
       if (total > maxBytes) throw Object.assign(new Error('Upload chunk is too large'), { status: 413 });
       await handle.write(chunk);
     }
-    await handle.sync();
     return total;
   } finally {
     await handle.close();
   }
 }
 
-async function listFiles() {
-  const entries = await fs.readdir(DATA_DIR, { withFileTypes: true });
-  const files = [];
-  for (const entry of entries) {
-    if (!entry.isFile() || entry.name.startsWith('.')) continue;
-    const stat = await fs.stat(path.join(DATA_DIR, entry.name));
-    files.push({ id: fileId(entry.name), name: entry.name, size: stat.size, modified: stat.mtimeMs });
+// Streams the request body straight into an existing file at a fixed offset.
+// Concurrent callers may target the same file as long as their ranges differ.
+// Socket chunks arrive around 64 KB, so they are gathered into WRITE_BATCH_SIZE
+// batches and flushed with a single positional writev instead of one write each.
+async function writeRequestAt(req, target, position, maxBytes) {
+  const handle = await fs.open(target, 'r+');
+  let total = 0;
+  let pending = [];
+  let pendingBytes = 0;
+  try {
+    const flush = async () => {
+      if (!pendingBytes) return;
+      await handle.writev(pending, position + total);
+      total += pendingBytes;
+      pending = [];
+      pendingBytes = 0;
+    };
+    for await (const chunk of req) {
+      if (total + pendingBytes + chunk.length > maxBytes) throw Object.assign(new Error('Upload chunk is too large'), { status: 413 });
+      pending.push(chunk);
+      pendingBytes += chunk.length;
+      if (pendingBytes >= WRITE_BATCH_SIZE) await flush();
+    }
+    await flush();
+    return total;
+  } finally {
+    await handle.close();
   }
-  return files;
+}
+
+// Parts are written into a file already sized by truncate, so no metadata
+// change needs flushing and fdatasync is enough.
+async function syncFile(target) {
+  const handle = await fs.open(target, 'r+');
+  try { await handle.datasync(); } finally { await handle.close(); }
 }
 
 async function listDirectory(relativePath = '') {
@@ -393,13 +446,12 @@ async function listDirectory(relativePath = '') {
     if (error.code === 'ENOENT' || error.code === 'ENOTDIR') throw Object.assign(new Error('Directory not found'), { status: 404 });
     throw error;
   }
-  const items = [];
-  for (const entry of entries) {
-    if (entry.name.startsWith('.') || (!entry.isFile() && !entry.isDirectory())) continue;
+  const visible = entries.filter(entry => !entry.name.startsWith('.') && (entry.isFile() || entry.isDirectory()) && validFilename(entry.name));
+  const items = await Promise.all(visible.map(async entry => {
     const relative = relativePath ? `${relativePath}/${entry.name}` : entry.name;
-    const stat = await fs.stat(storagePath(relative));
-    items.push({ id: fileId(relative), name: entry.name, path: relative, type: entry.isDirectory() ? 'dir' : 'file', size: entry.isFile() ? stat.size : 0, modified: stat.mtimeMs });
-  }
+    const stat = await fs.stat(path.join(directory, entry.name));
+    return { id: fileId(relative), name: entry.name, path: relative, type: entry.isDirectory() ? 'dir' : 'file', size: entry.isFile() ? stat.size : 0, modified: stat.mtimeMs };
+  }));
   return items.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : a.type === 'dir' ? -1 : 1));
 }
 
@@ -441,7 +493,7 @@ async function serveFile(req, res, name) {
   headers['Content-Length'] = Math.max(0, end - start + 1);
   res.writeHead(status, headers);
   if (req.method === 'HEAD' || stat.size === 0) return res.end();
-  createReadStream(target, { start, end }).pipe(res);
+  createReadStream(target, { start, end, highWaterMark: 1024 * 1024 }).pipe(res);
 }
 
 async function startUpload(req, res) {
@@ -485,6 +537,7 @@ async function finishUpload(res, id) {
   if (stat.size !== upload.metadata.size) return json(res, 409, { error: 'Upload is incomplete', offset: stat.size, expected: upload.metadata.size }, securityHeaders());
   const target = storagePath(upload.metadata.filename);
   await fs.mkdir(path.dirname(target), { recursive: true });
+  await syncFile(upload.partPath);
   await fs.rename(upload.partPath, target);
   await fs.unlink(upload.metaPath);
   json(res, 200, { ok: true, name: upload.metadata.filename, size: stat.size }, securityHeaders());
@@ -500,6 +553,7 @@ async function directUpload(req, res, name) {
     const size = await writeRequest(req, temp, 'wx', MAX_SINGLE_UPLOAD);
     const target = storagePath(name);
     await fs.mkdir(path.dirname(target), { recursive: true });
+    await syncFile(temp);
     await fs.rename(temp, target);
     json(res, 201, { ok: true, name, size }, securityHeaders());
   } catch (error) {
@@ -512,6 +566,12 @@ function parallelMetaPath(id) {
   return path.join(UPLOAD_DIR, `.parallel-${id}.json`);
 }
 
+function parallelDataPath(id) {
+  return path.join(UPLOAD_DIR, `.parallel-${id}.data`);
+}
+
+// Zero-byte marker recording that a part landed; the payload itself already
+// sits at its final offset inside the session's data file.
 function parallelPartPath(id, index) {
   return path.join(UPLOAD_DIR, `.parallel-${id}-${String(index).padStart(6, '0')}.part`);
 }
@@ -540,6 +600,8 @@ async function startParallelUpload(req, res, url, fileIdValue) {
   if (partCount > 100000) return json(res, 413, { error: 'Upload requires too many parts' }, securityHeaders());
   const id = crypto.randomUUID();
   const metadata = { id, filename, size, partSize: requestedPartSize, partCount, createdAt: Date.now() };
+  const data = await fs.open(parallelDataPath(id), 'wx', 0o600);
+  try { await data.truncate(size); } finally { await data.close(); }
   await fs.writeFile(parallelMetaPath(id), JSON.stringify(metadata), { flag: 'wx', mode: 0o600 });
   if (url.searchParams.get('format') === 'tsv') {
     const body = [id, requestedPartSize, partCount].join('\t') + '\n';
@@ -559,51 +621,38 @@ async function uploadParallelPart(req, res, id, index) {
   if (Number.isFinite(contentLength) && contentLength !== expected) {
     return json(res, 400, { error: 'Part size does not match expected size', expected }, securityHeaders());
   }
-  const temporary = path.join(UPLOAD_DIR, `${id}-${index}-${crypto.randomUUID()}.put`);
-  try {
-    const written = await writeRequest(req, temporary, 'wx', Math.max(1, expected));
-    if (written !== expected) return json(res, 400, { error: 'Part size does not match expected size', expected, written }, securityHeaders());
-    await fs.rename(temporary, parallelPartPath(id, index));
-    return json(res, 201, { ok: true, index, size: written }, securityHeaders());
-  } finally {
-    await fs.rm(temporary, { force: true });
-  }
+  const written = await writeRequestAt(req, parallelDataPath(id), index * metadata.partSize, expected);
+  if (written !== expected) return json(res, 400, { error: 'Part size does not match expected size', expected, written }, securityHeaders());
+  await fs.writeFile(parallelPartPath(id, index), '', { mode: 0o600 });
+  return json(res, 201, { ok: true, index, size: written }, securityHeaders());
 }
 
 async function removeParallelUpload(id, metadata) {
   const upload = metadata || await readParallelUpload(id);
   await Promise.all(Array.from({ length: upload.partCount }, (_, index) => fs.rm(parallelPartPath(id, index), { force: true })));
+  await fs.rm(parallelDataPath(id), { force: true });
   await fs.rm(parallelMetaPath(id), { force: true });
 }
 
 async function finishParallelUpload(res, id) {
   const metadata = await readParallelUpload(id);
+  const data = parallelDataPath(id);
   for (let index = 0; index < metadata.partCount; index++) {
-    let stat;
-    try { stat = await fs.stat(parallelPartPath(id, index)); } catch (error) {
+    try { await fs.access(parallelPartPath(id, index)); } catch (error) {
       if (error.code === 'ENOENT') return json(res, 409, { error: 'Upload is incomplete', missingPart: index }, securityHeaders());
       throw error;
     }
-    const expected = index === metadata.partCount - 1 ? metadata.size - index * metadata.partSize : metadata.partSize;
-    if (stat.size !== expected) return json(res, 409, { error: 'Upload part has an invalid size', part: index }, securityHeaders());
   }
 
-  const temporary = path.join(UPLOAD_DIR, crypto.randomUUID() + '.assemble');
-  try {
-    await fs.writeFile(temporary, '', { flag: 'wx', mode: 0o600 });
-    for (let index = 0; index < metadata.partCount; index++) {
-      await fs.appendFile(temporary, await fs.readFile(parallelPartPath(id, index)));
-    }
-    const stat = await fs.stat(temporary);
-    if (stat.size !== metadata.size) throw Object.assign(new Error('Assembled upload size mismatch'), { status: 409 });
-    const target = storagePath(metadata.filename);
-    await fs.mkdir(path.dirname(target), { recursive: true });
-    await fs.rename(temporary, target);
-    await removeParallelUpload(id, metadata);
-    return json(res, 200, { ok: true, name: metadata.filename, size: metadata.size }, securityHeaders());
-  } finally {
-    await fs.rm(temporary, { force: true });
-  }
+  const stat = await fs.stat(data);
+  if (stat.size !== metadata.size) return json(res, 409, { error: 'Assembled upload size mismatch', size: stat.size, expected: metadata.size }, securityHeaders());
+  // Parts were written without per-part fsync; flush once before publishing.
+  await syncFile(data);
+  const target = storagePath(metadata.filename);
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  await fs.rename(data, target);
+  await removeParallelUpload(id, metadata);
+  return json(res, 200, { ok: true, name: metadata.filename, size: metadata.size }, securityHeaders());
 }
 
 async function cleanupUploads() {
@@ -749,7 +798,10 @@ async function main() {
   await fs.mkdir(DATA_DIR, { recursive: true });
   await fs.mkdir(UPLOAD_DIR, { recursive: true, mode: 0o700 });
   await cleanupUploads();
-  setInterval(() => cleanupUploads().catch(error => console.error('upload cleanup failed', error)), 60 * 60 * 1000).unref();
+  setInterval(() => {
+    pruneFailedAuth();
+    cleanupUploads().catch(error => console.error('upload cleanup failed', error));
+  }, 60 * 60 * 1000).unref();
   const server = http.createServer((req, res) => {
     handle(req, res).catch(error => {
       if (!error.status || error.status >= 500) console.error(req.method, req.url, error);
