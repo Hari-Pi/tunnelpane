@@ -134,6 +134,72 @@ try {
   assert.ok(stat.blocks * 512 <= PART * 1.5, `preallocated file is not sparse: ${stat.blocks * 512} bytes on disk for ${stat.size} declared`);
   console.log(`  ok  abandoned session stays sparse (${stat.blocks * 512} bytes on disk, ${stat.size} declared)`);
 
+  console.log('round-trip savers:');
+
+  // Auto-finish: the part completing the set publishes the file itself.
+  const autoPayload = makePayload(PART * 3);
+  const auto = await startSession('auto.bin', autoPayload.length, PART);
+  const autoParts = partsOf(autoPayload, auto);
+  let reportedFinished = 0;
+  for (let index = 0; index < auto.partCount; index++) {
+    const response = await fetch(`${base}/api/cli/uploads/${auto.id}/parts/${index}?finish=1`, {
+      method: 'PUT', headers: { Authorization: auth, 'Content-Type': 'application/octet-stream' }, body: autoParts[index],
+    });
+    assert.ok(response.ok, `auto part ${index}`);
+    if ((await response.json()).finished) reportedFinished++;
+  }
+  assert.equal(reportedFinished, 1, 'exactly one part should report finishing');
+  assert.equal(sha(await download('auto.bin')), sha(autoPayload), 'auto-finish digest');
+  console.log('  ok  last part finishes the upload without a separate call');
+
+  // Resume: report which parts landed so a retry can skip them.
+  const resumePayload = makePayload(PART * 4);
+  const resume = await startSession('resume.bin', resumePayload.length, PART);
+  const resumeParts = partsOf(resumePayload, resume);
+  await putPart(resume.id, 0, resumeParts[0]);
+  await putPart(resume.id, 2, resumeParts[2]);
+  const state = await (await fetch(`${base}/api/cli/uploads/${resume.id}/parts`, { headers: { Authorization: auth } })).json();
+  assert.deepEqual(state.parts, [0, 2], 'landed parts');
+  assert.equal(state.partCount, 4);
+  for (const index of [1, 3]) assert.equal((await putPart(resume.id, index, resumeParts[index])).status, 201);
+  assert.equal((await finish(resume.id)).status, 200);
+  assert.equal(sha(await download('resume.bin')), sha(resumePayload), 'resumed digest');
+  console.log('  ok  landed parts are reported so retries resume');
+
+  // Batch: many small files in one request.
+  const batchFiles = Array.from({ length: 25 }, (_, i) => ({
+    path: `bundle/dir${i % 3}/file${i}.bin`,
+    payload: makePayload(500 + i * 37),
+  }));
+  const manifest = Buffer.from(JSON.stringify({ files: batchFiles.map(f => ({ path: f.path, size: f.payload.length })) }), 'utf8');
+  const header = Buffer.alloc(4);
+  header.writeUInt32BE(manifest.length, 0);
+  const batchBody = Buffer.concat([header, manifest, ...batchFiles.map(f => f.payload)]);
+  const batchResponse = await fetch(`${base}/api/cli/batch`, {
+    method: 'POST', headers: { Authorization: auth, 'Content-Type': 'application/octet-stream' }, body: batchBody,
+  });
+  assert.equal(batchResponse.status, 201, 'batch upload');
+  assert.equal((await batchResponse.json()).count, batchFiles.length);
+  for (const entry of batchFiles) {
+    assert.equal(sha(await download(entry.path)), sha(entry.payload), `batch digest ${entry.path}`);
+  }
+  console.log(`  ok  ${batchFiles.length} files landed in one request, nested paths intact`);
+
+  // Batch rejections
+  const escape = Buffer.from(JSON.stringify({ files: [{ path: '../escape.bin', size: 4 }] }), 'utf8');
+  const escapeHeader = Buffer.alloc(4);
+  escapeHeader.writeUInt32BE(escape.length, 0);
+  const escaped = await fetch(`${base}/api/cli/batch`, {
+    method: 'POST', headers: { Authorization: auth }, body: Buffer.concat([escapeHeader, escape, Buffer.alloc(4)]),
+  });
+  assert.equal(escaped.status, 400, 'path traversal in batch must be rejected');
+  console.log('  ok  batch rejects path traversal');
+
+  // Listing carries storage so the browser needs one round trip.
+  const listing = await (await fetch(`${base}/api/files`, { headers: { Authorization: auth } })).json();
+  assert.ok(listing.status && Number.isFinite(listing.status.free), 'listing should include storage');
+  console.log('  ok  listing includes storage status');
+
   console.log('\nAll correctness checks passed');
 } finally {
   child.kill('SIGKILL');

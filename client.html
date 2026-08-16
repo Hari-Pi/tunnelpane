@@ -179,10 +179,16 @@
   <input id="folderInput" type="file" webkitdirectory multiple hidden>
   <div class="notice" id="notice" role="status"></div>
   <script>
-    var FILE_CONCURRENCY = 3;
-    var PART_CONCURRENCY = 3;
-    var REQUEST_CEILING = 8;
-    var chunkSize = 8 * 1024 * 1024;
+    // Every request costs a full round trip through the tunnel (~240ms measured),
+    // so the client is tuned to spend requests sparingly and keep many in flight.
+    var FILE_CONCURRENCY = 4;
+    var PART_CONCURRENCY = 4;
+    var REQUEST_CEILING = 12;
+    var chunkSize = 16 * 1024 * 1024;
+    var SINGLE_SHOT_LIMIT = 16 * 1024 * 1024;   // one PUT instead of start+part+finish
+    var BATCH_FILE_LIMIT = 1024 * 1024;         // small enough to bundle with others
+    var BATCH_TOTAL_LIMIT = 32 * 1024 * 1024;
+    var BATCH_COUNT_LIMIT = 200;
 
     var files = [], currentPath = '';
     var staged = [], nextItemId = 1, collapsed = {}, running = false, storageFree = 0;
@@ -296,6 +302,26 @@
           await backoff(attempt, signal);
         }
       }
+    }
+
+    // fetch() cannot report upload progress, so single-shot uploads use XHR.
+    function putWithProgress(url, body, signal, onProgress) {
+      return new Promise(function(resolve, reject) {
+        var request = new XMLHttpRequest();
+        request.open('PUT', url);
+        request.setRequestHeader('Content-Type', 'application/octet-stream');
+        request.upload.onprogress = function(event) { if (event.lengthComputable) onProgress(event.loaded); };
+        request.onload = function() {
+          var body = {};
+          try { body = JSON.parse(request.responseText); } catch (_) {}
+          resolve({ ok: request.status >= 200 && request.status < 300, status: request.status, body: body });
+        };
+        request.onerror = function() { reject(new Error('Network error')); };
+        request.onabort = function() { reject(new DOMException('Aborted', 'AbortError')); };
+        if (signal.aborted) { request.abort(); return; }
+        signal.addEventListener('abort', function(){ request.abort() }, { once: true });
+        request.send(body);
+      });
     }
 
     function groupOf(relativePath) {
@@ -551,7 +577,8 @@
     function requeue(items) {
       items.forEach(function(item) {
         if (item.status !== 'failed' && item.status !== 'cancelled') return;
-        item.status = 'queued'; item.uploaded = 0; item.error = ''; item.sessionId = '';
+        // sessionId is left intact so a failed multipart upload resumes.
+        item.status = 'queued'; item.uploaded = 0; item.error = '';
       });
       renderStaged();
       runQueue();
@@ -567,42 +594,87 @@
       }
     }
 
-    async function uploadItem(item) {
-      item.status = 'uploading';
-      item.uploaded = 0;
-      item.error = '';
-      item.controller = new AbortController();
-      var signal = item.controller.signal;
+    function targetPath(item) {
+      return currentPath ? currentPath + '/' + item.relative : item.relative;
+    }
+
+    // One PUT, one round trip. Used for anything small enough not to need parts.
+    async function uploadSingleShot(item, signal) {
+      var base = 0;
+      var response = await putWithProgress('/api/cli/files/' + toFileId(targetPath(item)), item.file, signal, function(loaded) {
+        item.uploaded = base + loaded;
+        scheduleUpdate();
+      });
+      if (!response.ok) throw new Error(response.body.error || 'Upload failed');
+    }
+
+    async function uploadInParts(item, signal) {
       var file = item.file;
-      try {
-        var target = currentPath ? currentPath + '/' + item.relative : item.relative;
+      var partSize, partCount, done = {};
+
+      // An existing session means this is a retry: ask which parts already
+      // landed and send only the rest.
+      if (item.sessionId) {
+        var existing = await fetch('/api/cli/uploads/' + item.sessionId + '/parts', { signal });
+        if (existing.ok) {
+          var state = await existing.json();
+          partSize = state.partSize; partCount = state.partCount;
+          state.parts.forEach(function(index){ done[index] = true });
+          item.uploaded = state.parts.length * partSize;
+          if (item.uploaded > item.total) item.uploaded = item.total;
+        } else {
+          item.sessionId = '';
+        }
+      }
+
+      if (!item.sessionId) {
         var started = await sendWithRetry(function() {
-          return fetch('/api/cli/uploads/' + toFileId(target) + '?size=' + file.size + '&partSize=' + chunkSize + '&format=tsv', { method: 'POST', signal });
+          return fetch('/api/cli/uploads/' + toFileId(targetPath(item)) + '?size=' + file.size + '&partSize=' + chunkSize + '&format=tsv', { method: 'POST', signal });
         }, signal);
         if (!started.ok) throw await failure(started, 'Could not start upload');
         var fields = (await started.text()).trim().split('\t');
         item.sessionId = fields[0];
-        var partSize = Number(fields[1]);
-        var partCount = Number(fields[2]);
+        partSize = Number(fields[1]);
+        partCount = Number(fields[2]);
+      }
 
-        await pool(partCount, PART_CONCURRENCY, async function(index) {
-          if (signal.aborted) return;
-          var from = index * partSize, to = Math.min(from + partSize, file.size);
-          var response = await sendWithRetry(function() {
-            return fetch('/api/cli/uploads/' + item.sessionId + '/parts/' + index, {
-              method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' }, body: file.slice(from, to), signal,
-            });
-          }, signal);
-          if (!response.ok) throw await failure(response, 'Part ' + index + ' failed');
-          item.uploaded = item.uploaded + (to - from);
-          scheduleUpdate();
-        });
-        if (signal.aborted) return;
+      var finishedByPart = false;
+      await pool(partCount, PART_CONCURRENCY, async function(index) {
+        if (signal.aborted || done[index]) return;
+        var from = index * partSize, to = Math.min(from + partSize, file.size);
+        // finish=1 lets whichever part completes the set publish the file,
+        // saving the separate finish round trip.
+        var response = await sendWithRetry(function() {
+          return fetch('/api/cli/uploads/' + item.sessionId + '/parts/' + index + '?finish=1', {
+            method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' }, body: file.slice(from, to), signal,
+          });
+        }, signal);
+        if (!response.ok) throw await failure(response, 'Part ' + index + ' failed');
+        var result = await response.json().catch(function(){ return {} });
+        if (result.finished) finishedByPart = true;
+        item.uploaded = item.uploaded + (to - from);
+        scheduleUpdate();
+      });
+      if (signal.aborted) return;
 
+      if (!finishedByPart) {
         var finished = await sendWithRetry(function() {
           return fetch('/api/cli/uploads/' + item.sessionId + '/finish', { method: 'POST', signal });
         }, signal);
         if (!finished.ok) throw await failure(finished, 'Could not finish upload');
+      }
+    }
+
+    async function uploadItem(item) {
+      item.status = 'uploading';
+      if (!item.sessionId) item.uploaded = 0;
+      item.error = '';
+      item.controller = new AbortController();
+      var signal = item.controller.signal;
+      try {
+        if (item.file.size <= SINGLE_SHOT_LIMIT && !item.sessionId) await uploadSingleShot(item, signal);
+        else await uploadInParts(item, signal);
+        if (signal.aborted) return;
         item.sessionId = '';
         item.uploaded = item.total;
         item.status = 'done';
@@ -610,13 +682,49 @@
         if (item.status === 'cancelled' || signal.aborted) return;
         item.status = 'failed';
         item.error = error.message;
-        if (item.sessionId) {
-          fetch('/api/cli/uploads/' + item.sessionId, { method: 'DELETE' }).catch(function(){});
-          item.sessionId = '';
-        }
+        // The session is deliberately kept: retrying resumes from the parts
+        // that already landed. Abandoned sessions are swept server-side.
       } finally {
         scheduleUpdate();
       }
+    }
+
+    // Tiny files are dominated by round-trip cost, so they are shipped together
+    // in one request: [4-byte manifest length][manifest JSON][file bytes].
+    function takeBatch(pending) {
+      var picked = [], total = 0;
+      for (var i = 0; i < pending.length && picked.length < BATCH_COUNT_LIMIT; i++) {
+        var item = pending[i];
+        if (item.status !== 'queued' || item.sessionId) continue;
+        if (item.total > BATCH_FILE_LIMIT) continue;
+        if (total + item.total > BATCH_TOTAL_LIMIT) break;
+        picked.push(item);
+        total += item.total;
+      }
+      return picked.length > 1 ? picked : [];
+    }
+
+    async function uploadBatch(items, signal) {
+      var manifest = JSON.stringify({ files: items.map(function(item){ return { path: targetPath(item), size: item.total } }) });
+      var manifestBytes = new TextEncoder().encode(manifest);
+      var header = new Uint8Array(4);
+      new DataView(header.buffer).setUint32(0, manifestBytes.length, false);
+      var body = new Blob([header, manifestBytes].concat(items.map(function(item){ return item.file })));
+
+      items.forEach(function(item){ item.status = 'uploading'; item.uploaded = 0 });
+      scheduleUpdate();
+      var response = await sendWithRetry(function() {
+        return fetch('/api/cli/batch', { method: 'POST', body: body, signal });
+      }, signal);
+      if (!response.ok) throw await failure(response, 'Batch upload failed');
+      var result = await response.json();
+      var landed = {};
+      (result.files || []).forEach(function(name){ landed[name] = true });
+      items.forEach(function(item) {
+        if (landed[targetPath(item)]) { item.status = 'done'; item.uploaded = item.total; }
+        else { item.status = 'failed'; item.error = 'Not stored'; }
+      });
+      scheduleUpdate();
     }
 
     async function runQueue() {
@@ -632,6 +740,22 @@
         var pending = staged.filter(function(item){ return item.status === 'queued' });
         if (!pending.length) break;
         pending.forEach(function(item){ if (processed.indexOf(item) < 0) processed.push(item); });
+
+        var batch = takeBatch(pending);
+        if (batch.length) {
+          var controller = new AbortController();
+          batch.forEach(function(item){ item.controller = controller });
+          try { await uploadBatch(batch, controller.signal); }
+          catch (error) {
+            batch.forEach(function(item) {
+              if (item.status === 'cancelled') return;
+              item.status = 'failed'; item.error = error.message;
+            });
+          }
+          renderStaged();
+          continue;
+        }
+
         await pool(pending.length, FILE_CONCURRENCY, async function(index) {
           var item = pending[index];
           if (item.status !== 'queued') return;
@@ -700,14 +824,16 @@
 
     async function refresh() {
       try {
+        // Listing and storage arrive together, so navigation costs one round trip.
         var result = await api('/api/files?path=' + encodeURIComponent(currentPath));
         files = result.files; render();
         renderBreadcrumbs();
         document.getElementById('up').disabled = !currentPath;
         renderStaged();
-        var status = await api('/api/status');
-        storageFree = status.free;
-        document.getElementById('storage').textContent = formatBytes(status.used) + ' used / ' + formatBytes(status.total) + ' total';
+        if (result.status) {
+          storageFree = result.status.free;
+          document.getElementById('storage').textContent = formatBytes(result.status.used) + ' used / ' + formatBytes(result.status.total) + ' total';
+        }
       } catch (error) { showNotice(error.message, true); }
     }
 

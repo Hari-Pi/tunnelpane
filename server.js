@@ -263,6 +263,8 @@ function cliFolderIdFromPath(pathname) {
 function parallelUploadRoute(pathname) {
   let match = pathname.match(/^\/api\/cli\/uploads\/([A-Za-z0-9_-]+)$/);
   if (match) return { action: 'start', fileId: match[1] };
+  match = pathname.match(/^\/api\/cli\/uploads\/([a-f0-9-]{36})\/parts$/);
+  if (match) return { action: 'partList', sessionId: match[1] };
   match = pathname.match(/^\/api\/cli\/uploads\/([a-f0-9-]{36})\/parts\/(\d+)$/);
   if (match) return { action: 'part', sessionId: match[1], partIndex: Number(match[2]) };
   match = pathname.match(/^\/api\/cli\/uploads\/([a-f0-9-]{36})\/(finish)$/);
@@ -469,6 +471,9 @@ function parallelMetaPath(id) {
   return path.join(UPLOAD_DIR, `.parallel-${id}.json`);
 }
 
+// Guards auto-finish so concurrent final parts cannot both publish.
+const finishing = new Set();
+
 function parallelDataPath(id) {
   return path.join(UPLOAD_DIR, `.parallel-${id}.data`);
 }
@@ -514,7 +519,7 @@ async function startParallelUpload(req, res, url, fileIdValue) {
   return json(res, 201, metadata, securityHeaders());
 }
 
-async function uploadParallelPart(req, res, id, index) {
+async function uploadParallelPart(req, res, id, index, finishWhenComplete) {
   const metadata = await readParallelUpload(id);
   if (!Number.isSafeInteger(index) || index < 0 || index >= metadata.partCount) {
     return json(res, 400, { error: 'Invalid part index' }, securityHeaders());
@@ -527,7 +532,37 @@ async function uploadParallelPart(req, res, id, index) {
   const written = await writeRequestAt(req, parallelDataPath(id), index * metadata.partSize, expected);
   if (written !== expected) return json(res, 400, { error: 'Part size does not match expected size', expected, written }, securityHeaders());
   await fs.writeFile(parallelPartPath(id, index), '', { mode: 0o600 });
+
+  // The client may ask the part that completes the set to publish the file,
+  // which saves a whole round trip on a high-latency link.
+  if (finishWhenComplete && !finishing.has(id)) {
+    finishing.add(id);
+    try {
+      if (await landedParts(id, metadata.partCount) === metadata.partCount) {
+        const result = await assembleParallelUpload(id, metadata);
+        if (result.ok) return json(res, 200, { ok: true, index, size: written, finished: true, name: result.name, size: result.size }, securityHeaders());
+      }
+    } finally {
+      finishing.delete(id);
+    }
+  }
   return json(res, 201, { ok: true, index, size: written }, securityHeaders());
+}
+
+async function landedParts(id, partCount) {
+  const present = await Promise.all(Array.from({ length: partCount }, (_, index) =>
+    fs.access(parallelPartPath(id, index)).then(() => true, () => false)));
+  return present.filter(Boolean).length;
+}
+
+async function listParallelParts(res, id) {
+  const metadata = await readParallelUpload(id);
+  const present = await Promise.all(Array.from({ length: metadata.partCount }, (_, index) =>
+    fs.access(parallelPartPath(id, index)).then(() => index, () => -1)));
+  return json(res, 200, {
+    id, partSize: metadata.partSize, partCount: metadata.partCount, size: metadata.size,
+    filename: metadata.filename, parts: present.filter(index => index >= 0),
+  }, securityHeaders());
 }
 
 async function removeParallelUpload(id, metadata) {
@@ -537,25 +572,109 @@ async function removeParallelUpload(id, metadata) {
   await fs.rm(parallelMetaPath(id), { force: true });
 }
 
-async function finishParallelUpload(res, id) {
-  const metadata = await readParallelUpload(id);
+// Publishes a session whose parts have all arrived. Returns a plain result so
+// both the explicit finish route and the auto-finish on the last part can use it.
+async function assembleParallelUpload(id, metadata) {
   const data = parallelDataPath(id);
   for (let index = 0; index < metadata.partCount; index++) {
     try { await fs.access(parallelPartPath(id, index)); } catch (error) {
-      if (error.code === 'ENOENT') return json(res, 409, { error: 'Upload is incomplete', missingPart: index }, securityHeaders());
+      if (error.code === 'ENOENT') return { ok: false, status: 409, error: 'Upload is incomplete', missingPart: index };
       throw error;
     }
   }
-
   const stat = await fs.stat(data);
-  if (stat.size !== metadata.size) return json(res, 409, { error: 'Assembled upload size mismatch', size: stat.size, expected: metadata.size }, securityHeaders());
+  if (stat.size !== metadata.size) return { ok: false, status: 409, error: 'Assembled upload size mismatch', size: stat.size, expected: metadata.size };
   // Parts were written without per-part fsync; flush once before publishing.
   await syncFile(data);
   const target = storagePath(metadata.filename);
   await fs.mkdir(path.dirname(target), { recursive: true });
   await fs.rename(data, target);
   await removeParallelUpload(id, metadata);
-  return json(res, 200, { ok: true, name: metadata.filename, size: metadata.size }, securityHeaders());
+  return { ok: true, name: metadata.filename, size: metadata.size };
+}
+
+async function finishParallelUpload(res, id) {
+  const metadata = await readParallelUpload(id);
+  const result = await assembleParallelUpload(id, metadata);
+  if (!result.ok) {
+    const { status, ...body } = result;
+    return json(res, status, body, securityHeaders());
+  }
+  return json(res, 200, { ok: true, name: result.name, size: result.size }, securityHeaders());
+}
+
+// Batch upload wire format, chosen so the client needs no archive library and
+// the server never buffers more than one small file:
+//   [4 bytes big-endian manifest length][manifest JSON][file bytes, in order]
+// The manifest lives in the body rather than a header because a few hundred
+// paths would blow past the maximum header size.
+const BATCH_MAX_FILES = 500;
+const BATCH_MAX_FILE_SIZE = 4 * 1024 * 1024;
+const BATCH_MAX_TOTAL = 48 * 1024 * 1024;
+const BATCH_MAX_MANIFEST = 256 * 1024;
+
+function bodyReader(req) {
+  const iterator = req[Symbol.asyncIterator]();
+  let buffer = Buffer.alloc(0);
+  let ended = false;
+  return async function read(count) {
+    while (buffer.length < count && !ended) {
+      const next = await iterator.next();
+      if (next.done) { ended = true; break; }
+      buffer = buffer.length ? Buffer.concat([buffer, next.value]) : next.value;
+    }
+    if (buffer.length < count) throw Object.assign(new Error('Batch body ended early'), { status: 400 });
+    const chunk = buffer.subarray(0, count);
+    buffer = buffer.subarray(count);
+    return chunk;
+  };
+}
+
+async function batchUpload(req, res) {
+  const contentLength = Number(req.headers['content-length']);
+  if (Number.isFinite(contentLength) && contentLength > BATCH_MAX_TOTAL + BATCH_MAX_MANIFEST + 4) {
+    return json(res, 413, { error: 'Batch is too large' }, securityHeaders());
+  }
+  const read = bodyReader(req);
+  const manifestLength = (await read(4)).readUInt32BE(0);
+  if (manifestLength > BATCH_MAX_MANIFEST) return json(res, 413, { error: 'Batch manifest is too large' }, securityHeaders());
+
+  let manifest;
+  try { manifest = JSON.parse((await read(manifestLength)).toString('utf8')); } catch {
+    return json(res, 400, { error: 'Invalid batch manifest' }, securityHeaders());
+  }
+  const entries = Array.isArray(manifest.files) ? manifest.files : null;
+  if (!entries || !entries.length) return json(res, 400, { error: 'Batch manifest has no files' }, securityHeaders());
+  if (entries.length > BATCH_MAX_FILES) return json(res, 413, { error: `A batch holds at most ${BATCH_MAX_FILES} files` }, securityHeaders());
+
+  let total = 0;
+  for (const entry of entries) {
+    if (!entry || !validRelativePath(entry.path)) return json(res, 400, { error: `Invalid path in batch: ${entry && entry.path}` }, securityHeaders());
+    if (!Number.isSafeInteger(entry.size) || entry.size < 0 || entry.size > BATCH_MAX_FILE_SIZE) {
+      return json(res, 413, { error: `File too large for a batch: ${entry.path}` }, securityHeaders());
+    }
+    total += entry.size;
+  }
+  if (total > BATCH_MAX_TOTAL) return json(res, 413, { error: 'Batch is too large' }, securityHeaders());
+
+  // Each file is renamed into place as its bytes arrive, so an interrupted
+  // batch leaves whole files rather than truncated ones.
+  const written = [];
+  for (const entry of entries) {
+    const payload = await read(entry.size);
+    const temporary = path.join(UPLOAD_DIR, crypto.randomUUID() + '.batch');
+    try {
+      await fs.writeFile(temporary, payload, { flag: 'wx', mode: 0o600 });
+      const target = storagePath(entry.path);
+      await fs.mkdir(path.dirname(target), { recursive: true });
+      await fs.rename(temporary, target);
+      written.push(entry.path);
+    } catch (error) {
+      await fs.rm(temporary, { force: true });
+      throw error;
+    }
+  }
+  return json(res, 201, { ok: true, count: written.length, files: written }, securityHeaders());
 }
 
 async function cleanupUploads() {
@@ -599,10 +718,15 @@ async function handle(req, res) {
     res.writeHead(200, { ...securityHeaders(), 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': Buffer.byteLength(HTML) });
     return res.end(HTML);
   }
+  if (req.method === 'POST' && url.pathname === '/api/cli/batch') return batchUpload(req, res);
   if (req.method === 'GET' && url.pathname === '/api/files') {
     const directory = url.searchParams.get('path') || '';
     if (directory && !validRelativePath(directory)) return json(res, 400, { error: 'Invalid directory' }, securityHeaders());
-    return json(res, 200, { path: directory, files: await listDirectory(directory) }, securityHeaders());
+    // Storage is bundled in so the browser needs one round trip, not two.
+    const [items, disk] = await Promise.all([listDirectory(directory), fs.statfs(DATA_DIR)]);
+    const total = disk.blocks * disk.bsize;
+    const free = disk.bavail * disk.bsize;
+    return json(res, 200, { path: directory, files: items, status: { total, free, used: total - free } }, securityHeaders());
   }
   if (req.method === 'GET' && url.pathname === '/api/cli/files') {
     const directoryId = url.searchParams.get('path');
@@ -649,7 +773,10 @@ async function handle(req, res) {
       await removeParallelUpload(parallelRoute.fileId);
       return json(res, 200, { ok: true }, securityHeaders());
     }
-    if (req.method === 'PUT' && parallelRoute.action === 'part') return uploadParallelPart(req, res, parallelRoute.sessionId, parallelRoute.partIndex);
+    if (req.method === 'GET' && parallelRoute.action === 'partList') return listParallelParts(res, parallelRoute.sessionId);
+    if (req.method === 'PUT' && parallelRoute.action === 'part') {
+      return uploadParallelPart(req, res, parallelRoute.sessionId, parallelRoute.partIndex, url.searchParams.get('finish') === '1');
+    }
     if (req.method === 'POST' && parallelRoute.action === 'finish') return finishParallelUpload(res, parallelRoute.sessionId);
     if (req.method === 'DELETE' && parallelRoute.action === 'session') {
       await removeParallelUpload(parallelRoute.sessionId);
