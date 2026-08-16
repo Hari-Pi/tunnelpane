@@ -56,6 +56,7 @@ const MIME_TYPES = new Map([
 ]);
 
 const HTML = readFileSync(path.join(__dirname, 'client.html'), 'utf8');
+const LOGIN_HTML = readFileSync(path.join(__dirname, 'login.html'), 'utf8');
 
 function sha256(value) {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -63,6 +64,57 @@ function sha256(value) {
 
 const AUTH_USER_DIGEST = Buffer.from(sha256(AUTH_USER));
 const AUTH_PASSWORD_DIGEST = Buffer.from(AUTH_PASSWORD_HASH.toLowerCase());
+
+// Derived from the credentials, so sessions survive a restart but are revoked
+// the moment the username or password changes. No server-side session store.
+const SESSION_COOKIE = 'tunnelpane_session';
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const SESSION_SECRET = crypto.createHash('sha256').update(`tunnelpane-session:${AUTH_USER}:${AUTH_PASSWORD_HASH}`).digest();
+const SECURE_COOKIES = PUBLIC_URL.startsWith('https:');
+
+function signSession(payload) {
+  return crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+}
+
+function createSessionToken() {
+  const payload = Buffer.from(JSON.stringify({ exp: Date.now() + SESSION_TTL_MS }), 'utf8').toString('base64url');
+  return `${payload}.${signSession(payload)}`;
+}
+
+function verifySessionToken(token) {
+  const separator = typeof token === 'string' ? token.indexOf('.') : -1;
+  if (separator < 1) return false;
+  const payload = token.slice(0, separator);
+  const signature = token.slice(separator + 1);
+  const expected = signSession(payload);
+  if (signature.length !== expected.length) return false;
+  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) return false;
+  try {
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    return Number.isFinite(data.exp) && data.exp > Date.now();
+  } catch { return false; }
+}
+
+function cookieValue(req, name) {
+  for (const pair of (req.headers.cookie || '').split(';')) {
+    const separator = pair.indexOf('=');
+    if (separator < 0) continue;
+    if (pair.slice(0, separator).trim() === name) return pair.slice(separator + 1).trim();
+  }
+  return '';
+}
+
+function sessionCookie(value, maxAgeSeconds) {
+  const parts = [`${SESSION_COOKIE}=${value}`, 'Path=/', 'HttpOnly', 'SameSite=Strict', `Max-Age=${maxAgeSeconds}`];
+  if (SECURE_COOKIES) parts.push('Secure');
+  return parts.join('; ');
+}
+
+// Browsers get the sign-in page; anything else keeps the Basic challenge so the
+// terminal clients and curl behave exactly as before.
+function wantsHtml(req) {
+  return (req.headers.accept || '').includes('text/html');
+}
 
 function pruneFailedAuth() {
   const now = Date.now();
@@ -80,6 +132,8 @@ function clientIp(req) {
 }
 
 function isAuthorized(req) {
+  if (verifySessionToken(cookieValue(req, SESSION_COOKIE))) return true;
+
   const ip = clientIp(req);
   const state = failedAuth.get(ip);
   if (state && state.until > Date.now() && state.count >= FAILED_AUTH_LIMIT) return false;
@@ -100,6 +154,44 @@ function isAuthorized(req) {
   current.count += 1;
   failedAuth.set(ip, current);
   return false;
+}
+
+function lockedOut(ip) {
+  const state = failedAuth.get(ip);
+  return Boolean(state && state.until > Date.now() && state.count >= FAILED_AUTH_LIMIT);
+}
+
+function recordFailure(ip) {
+  const state = failedAuth.get(ip);
+  const current = state && state.until > Date.now() ? state : { count: 0, until: Date.now() + FAILED_AUTH_WINDOW_MS };
+  current.count += 1;
+  failedAuth.set(ip, current);
+}
+
+async function startSession(req, res) {
+  const ip = clientIp(req);
+  if (lockedOut(ip)) return json(res, 429, { error: 'Too many attempts. Try again later.' }, securityHeaders());
+  const body = await readJson(req);
+  const user = typeof body.username === 'string' ? body.username : '';
+  const password = typeof body.password === 'string' ? body.password : '';
+  // Both comparisons always run so a wrong username costs the same as a wrong password.
+  const userOk = crypto.timingSafeEqual(Buffer.from(sha256(user)), AUTH_USER_DIGEST);
+  const passOk = crypto.timingSafeEqual(Buffer.from(sha256(password)), AUTH_PASSWORD_DIGEST);
+  if (!userOk || !passOk) {
+    recordFailure(ip);
+    return json(res, 401, { error: 'Incorrect username or password' }, securityHeaders());
+  }
+  failedAuth.delete(ip);
+  json(res, 200, { ok: true }, { ...securityHeaders(), 'Set-Cookie': sessionCookie(createSessionToken(), Math.floor(SESSION_TTL_MS / 1000)) });
+}
+
+function endSession(res) {
+  json(res, 200, { ok: true }, { ...securityHeaders(), 'Set-Cookie': sessionCookie('', 0) });
+}
+
+function serveLogin(res) {
+  res.writeHead(200, { ...securityHeaders(), 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': Buffer.byteLength(LOGIN_HTML) });
+  res.end(LOGIN_HTML);
 }
 
 function challenge(res) {
@@ -499,7 +591,9 @@ async function handle(req, res) {
     res.writeHead(200, { ...securityHeaders(), 'Cache-Control': 'public, max-age=604800', 'Content-Type': 'image/png', 'Content-Length': APPLE_TOUCH_ICON.length });
     return res.end(APPLE_TOUCH_ICON);
   }
-  if (!isAuthorized(req)) return challenge(res);
+  if (req.method === 'POST' && url.pathname === '/api/session') return startSession(req, res);
+  if (req.method === 'DELETE' && url.pathname === '/api/session') return endSession(res);
+  if (!isAuthorized(req)) return wantsHtml(req) ? serveLogin(res) : challenge(res);
 
   if (req.method === 'GET' && url.pathname === '/') {
     res.writeHead(200, { ...securityHeaders(), 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': Buffer.byteLength(HTML) });

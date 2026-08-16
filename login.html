@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Sign in · TunnelPane</title>
+  <link rel="icon" href="/favicon.svg?v=2" type="image/svg+xml">
+  <link rel="alternate icon" href="/favicon.ico?v=2" type="image/png">
+  <link rel="icon" href="/favicon-32.png?v=2" sizes="32x32" type="image/png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=2">
+  <script>
+    try {
+      var savedTheme = localStorage.getItem('tunnelpane-theme');
+      var preferredTheme = savedTheme || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      document.documentElement.dataset.theme = preferredTheme;
+    } catch (_) {
+      document.documentElement.dataset.theme = 'light';
+    }
+  </script>
+  <style>
+    :root{color-scheme:light;--bg:#f4f6f5;--surface:#fff;--ink:#202522;--muted:#69716c;--line:#d9dedb;--green:#16835b;--green-dark:#0c6544;--red:#b52d3a;--danger-soft:#fff3f4;--shadow:#0000001f;--focus:#16835b55;--local:#0f7d8c}
+    :root[data-theme=dark]{color-scheme:dark;--bg:#0d110e;--surface:#151b17;--ink:#eef4ef;--muted:#9ba8a1;--line:#334139;--green:#43c589;--green-dark:#31ad75;--red:#ff7b88;--danger-soft:#3a2024;--shadow:#00000066;--focus:#43c58966;--local:#5ec9d8}
+    *{box-sizing:border-box}
+    body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;
+      background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    .card{width:min(380px,100%);background:var(--surface);border:1px solid var(--line);border-top:2px solid var(--local);
+      border-radius:9px;padding:30px 28px 26px;box-shadow:0 12px 36px var(--shadow)}
+    .brand{font-size:23px;font-weight:750;margin-bottom:4px}.brand span{color:var(--green)}
+    .lede{color:var(--muted);font-size:14px;margin-bottom:22px}
+    label{display:block;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-bottom:6px}
+    .field{margin-bottom:15px}
+    input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink);font:inherit}
+    input:focus-visible{outline:3px solid var(--focus);outline-offset:1px;border-color:var(--green)}
+    button{width:100%;margin-top:6px;padding:11px;border:1px solid transparent;border-radius:6px;background:var(--green);color:#fff;font:inherit;font-weight:700;cursor:pointer}
+    button:hover{background:var(--green-dark)}
+    button:disabled{opacity:.6;cursor:progress}
+    .error{display:none;margin-bottom:16px;padding:9px 12px;border-radius:6px;background:var(--danger-soft);color:var(--red);font-size:14px;border:1px solid var(--red)}
+    .error.show{display:block}
+    .hint{margin-top:16px;text-align:center;font-size:12.5px;color:var(--muted)}
+  </style>
+</head>
+<body>
+  <form class="card" id="form" autocomplete="on">
+    <div class="brand">Tunnel<span>Pane</span></div>
+    <div class="lede">Sign in to reach your files.</div>
+    <div class="error" id="error" role="alert"></div>
+    <div class="field">
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none"
+             autocorrect="off" spellcheck="false" required autofocus>
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+    </div>
+    <button type="submit" id="submit">Sign in</button>
+    <div class="hint">Terminal clients keep using their own sign-in.</div>
+  </form>
+  <script>
+    var form = document.getElementById('form');
+    var username = document.getElementById('username');
+    var password = document.getElementById('password');
+    var submit = document.getElementById('submit');
+    var error = document.getElementById('error');
+
+    // Autofocus can be lost when the browser restores scroll or a password
+    // manager paints over the field, so claim it again once painted.
+    window.addEventListener('load', function() {
+      if (document.activeElement !== password) username.focus();
+    });
+
+    // Submit on Enter from either field explicitly, rather than depending on
+    // the browser's implicit form submission.
+    [username, password].forEach(function(field) {
+      field.addEventListener('keydown', function(event) {
+        if (event.key !== 'Enter') return;
+        event.preventDefault();
+        if (form.reportValidity()) form.requestSubmit();
+      });
+    });
+
+    function fail(message) {
+      error.textContent = message;
+      error.classList.add('show');
+      submit.disabled = false;
+      submit.textContent = 'Sign in';
+      password.value = '';
+      password.focus();
+    }
+
+    form.addEventListener('submit', async function(event) {
+      event.preventDefault();
+      error.classList.remove('show');
+      submit.disabled = true;
+      submit.textContent = 'Signing in...';
+      try {
+        var response = await fetch('/api/session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: username.value, password: password.value }),
+        });
+        if (response.ok) { location.reload(); return; }
+        var body = await response.json().catch(function(){ return {} });
+        fail(body.error || 'Sign in failed');
+      } catch (_) {
+        fail('Could not reach the server');
+      }
+    });
+  </script>
+</body>
+</html>

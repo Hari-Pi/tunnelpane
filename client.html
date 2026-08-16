@@ -123,6 +123,7 @@
       <div class="brand">Tunnel<span>Pane</span></div>
       <div class="header-tools">
         <div class="storage" id="storage">Checking storage...</div>
+        <button class="secondary" id="signOut" type="button">Sign out</button>
         <button class="theme-toggle" id="themeToggle" type="button" aria-label="Switch theme" title="Switch theme"></button>
       </div>
     </div>
@@ -763,6 +764,12 @@
 
     document.getElementById('up').onclick=function(){currentPath=currentPath.includes('/')?currentPath.slice(0,currentPath.lastIndexOf('/')):'';refresh()};
     document.getElementById('newFolder').onclick=async function(){var name=prompt('Folder name');if(!name)return;try{await api('/api/cli/folders/'+toFileId(joined(name)),{method:'POST'});await refresh()}catch(error){showNotice(error.message,true)}};
+    document.getElementById('signOut').onclick=async function(){
+      if (staged.some(function(item){ return item.status === 'uploading' }) && !confirm('Uploads are still running. Sign out anyway?')) return;
+      staged.forEach(cancelItem);
+      try { await fetch('/api/session', { method: 'DELETE' }); } catch (_) {}
+      location.reload();
+    };
     document.getElementById('search').oninput=render;
     document.getElementById('sort').onchange=render;
     document.getElementById('refresh').onclick=refresh;

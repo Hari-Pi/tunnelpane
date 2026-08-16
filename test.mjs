@@ -136,6 +136,51 @@ try {
   response = await fetch(base + '/hello.txt', { method: 'DELETE', headers: { Authorization: auth } });
   assert.equal(response.status, 200);
   assert.equal((await fetch(base + '/hello.txt', { headers: { Authorization: auth } })).status, 404);
+  // Browsers get a sign-in page instead of the Basic popup; everything else
+  // keeps the challenge so the terminal clients are unaffected.
+  const loginPage = await fetch(base + '/', { headers: { Accept: 'text/html' } });
+  assert.equal(loginPage.status, 200);
+  assert.equal(loginPage.headers.get('www-authenticate'), null);
+  const loginHtml = await loginPage.text();
+  assert.match(loginHtml, /id="password"/);
+  assert.match(loginHtml, /autofocus/);
+
+  const apiChallenge = await fetch(base + '/api/files');
+  assert.equal(apiChallenge.status, 401);
+  assert.match(apiChallenge.headers.get('www-authenticate'), /^Basic/);
+
+  assert.equal((await fetch(base + '/api/session', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'test-user', password: 'wrong' }),
+  })).status, 401);
+
+  const signIn = await fetch(base + '/api/session', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'test-user', password }),
+  });
+  assert.equal(signIn.status, 200);
+  const cookie = signIn.headers.getSetCookie().find(value => value.startsWith('tunnelpane_session='));
+  assert.ok(cookie, 'session cookie was not set');
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /SameSite=Strict/);
+
+  const token = cookie.split(';')[0];
+  const withSession = await fetch(base + '/', { headers: { Accept: 'text/html', Cookie: token } });
+  assert.equal(withSession.status, 200);
+  assert.match(await withSession.text(), /id="stagedList"/);
+  assert.equal((await fetch(base + '/api/files', { headers: { Cookie: token } })).status, 200);
+
+  // A tampered signature must not authenticate.
+  const forged = token.slice(0, -3) + 'aaa';
+  assert.equal((await fetch(base + '/api/files', { headers: { Cookie: forged } })).status, 401);
+
+  // Basic auth still works for the terminal clients.
+  assert.equal((await fetch(base + '/api/files', { headers: { Authorization: auth } })).status, 200);
+
+  const signOut = await fetch(base + '/api/session', { method: 'DELETE' });
+  assert.equal(signOut.status, 200);
+  assert.match(signOut.headers.getSetCookie().find(value => value.startsWith('tunnelpane_session=')), /Max-Age=0/);
+
   console.log('All TunnelPane tests passed');
 } finally {
   child.kill('SIGTERM');
