@@ -173,6 +173,11 @@
         <table><thead><tr><th>File</th><th>Size</th><th>Modified</th><th></th></tr></thead><tbody id="files"></tbody></table>
         <div class="empty" id="empty">No files yet.</div>
       </div>
+      <div class="pane-foot" id="downloadFoot" style="display:none">
+        <div class="foot-summary" id="downloadLabel"></div>
+        <div class="group-progress"><span id="downloadFill"></span></div>
+        <button class="danger" id="downloadCancel" type="button">Cancel</button>
+      </div>
     </section>
   </main>
   <input id="fileInput" type="file" multiple hidden>
@@ -189,6 +194,12 @@
     var BATCH_FILE_LIMIT = 1024 * 1024;         // small enough to bundle with others
     var BATCH_TOTAL_LIMIT = 32 * 1024 * 1024;
     var BATCH_COUNT_LIMIT = 200;
+    // Ranged parallel download. Without a writable local handle the file is
+    // assembled in memory, so this only applies to a size range worth the RAM.
+    var DOWNLOAD_PART = 8 * 1024 * 1024;
+    var DOWNLOAD_CONCURRENCY = 4;
+    var FAST_DOWNLOAD_MIN = 8 * 1024 * 1024;
+    var FAST_DOWNLOAD_MAX = 256 * 1024 * 1024;
 
     var files = [], currentPath = '';
     var staged = [], nextItemId = 1, collapsed = {}, running = false, storageFree = 0;
@@ -775,6 +786,63 @@
       await refresh();
     }
 
+    var download = null;
+    function renderDownload() {
+      var foot = document.getElementById('downloadFoot');
+      if (!download) { foot.style.display = 'none'; return; }
+      foot.style.display = 'flex';
+      var percent = download.total ? Math.min(100, Math.round(download.received / download.total * 100)) : 0;
+      document.getElementById('downloadLabel').textContent = download.name + ' · ' + percent + '% of ' + formatBytes(download.total);
+      document.getElementById('downloadFill').style.width = percent + '%';
+    }
+
+    function saveBlob(blob, name) {
+      var url = URL.createObjectURL(blob);
+      var anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = name;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(function(){ URL.revokeObjectURL(url) }, 60000);
+    }
+
+    // One connection cannot fill a high-latency pipe, so ranges are fetched in
+    // parallel and reassembled. Falls back to the plain link on any trouble.
+    async function fastDownload(file, href) {
+      var parts = Math.ceil(file.size / DOWNLOAD_PART);
+      var chunks = new Array(parts);
+      var controller = new AbortController();
+      download = { name: file.name, total: file.size, received: 0, controller: controller };
+      renderDownload();
+      try {
+        await pool(parts, DOWNLOAD_CONCURRENCY, async function(index) {
+          var from = index * DOWNLOAD_PART;
+          var to = Math.min(from + DOWNLOAD_PART, file.size) - 1;
+          var response = await sendWithRetry(function() {
+            return fetch(href, { headers: { Range: 'bytes=' + from + '-' + to }, signal: controller.signal });
+          }, controller.signal);
+          if (response.status !== 206) throw new Error('Server did not honour the range request');
+          var buffer = await response.arrayBuffer();
+          if (buffer.byteLength !== to - from + 1) throw new Error('Short range response');
+          chunks[index] = buffer;
+          download.received = download.received + buffer.byteLength;
+          renderDownload();
+        });
+        var blob = new Blob(chunks);
+        if (blob.size !== file.size) throw new Error('Assembled size mismatch');
+        saveBlob(blob, file.name);
+        showNotice('Downloaded ' + file.name);
+      } catch (error) {
+        if (controller.signal.aborted) { showNotice('Download cancelled'); return; }
+        showNotice('Falling back to a direct download: ' + error.message, true);
+        window.location.href = href;
+      } finally {
+        download = null;
+        renderDownload();
+      }
+    }
+
     function render() {
       var query = document.getElementById('search').value.toLowerCase();
       var sort = document.getElementById('sort').value;
@@ -785,7 +853,17 @@
         var row=document.createElement('tr');
         var name=document.createElement('td'); name.className='file-name';
         var link=document.createElement('a'); link.textContent=file.name+(file.type==='dir'?'/':'');
-        if(file.type==='dir'){link.href='#';link.onclick=function(event){event.preventDefault();currentPath=joined(file.name);refresh()}}else{link.href=fileUrl(file.name)}
+        if(file.type==='dir'){link.href='#';link.onclick=function(event){event.preventDefault();currentPath=joined(file.name);refresh()}}
+        else{
+          link.href=fileUrl(file.name);
+          if(file.size>=FAST_DOWNLOAD_MIN&&file.size<=FAST_DOWNLOAD_MAX){
+            link.onclick=function(event){
+              if(download){showNotice('One download at a time',true);event.preventDefault();return}
+              event.preventDefault();
+              fastDownload(file,link.href);
+            };
+          }
+        }
         name.appendChild(link);
         var size=document.createElement('td'); size.textContent=file.type==='dir'?'—':formatBytes(file.size);
         var date=document.createElement('td'); date.textContent=new Date(file.modified).toLocaleString();
@@ -896,6 +974,7 @@
       try { await fetch('/api/session', { method: 'DELETE' }); } catch (_) {}
       location.reload();
     };
+    document.getElementById('downloadCancel').onclick=function(){ if(download) download.controller.abort() };
     document.getElementById('search').oninput=render;
     document.getElementById('sort').onchange=render;
     document.getElementById('refresh').onclick=refresh;
