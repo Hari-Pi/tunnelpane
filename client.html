@@ -58,8 +58,9 @@
     .search{flex:1;min-width:0;border:1px solid var(--line);border-radius:5px;padding:7px 10px}
     .sort{border:1px solid var(--line);border-radius:5px;padding:7px 26px 7px 9px;background:var(--surface)}
     .pane-body{flex:1;min-height:0;overflow:auto}
-    .pane-foot{border-top:1px solid var(--line);padding:9px 12px;display:flex;align-items:center;gap:8px;background:var(--surface-2);flex-wrap:wrap}
-    .foot-summary{flex:1;min-width:0;font-size:13px;color:var(--muted)}
+    .pane-foot{border-top:1px solid var(--line);padding:9px 12px;display:flex;flex-direction:column;align-items:stretch;gap:8px;background:var(--surface-2)}
+    .foot-summary{font-size:13px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .foot-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
     .pane-local.drag{background:var(--upload-drag)}
     .dropnote{padding:34px 18px;text-align:center;color:var(--muted)}
     .dropnote strong{display:block;font-size:16px;color:var(--ink);margin-bottom:5px}
@@ -84,6 +85,11 @@
     .item.cancelled .progress span{background:var(--muted)}
     .group-progress{height:4px;background:var(--progress-bg);border-radius:3px;overflow:hidden;width:70px;flex:0 0 auto}
     .group-progress span{display:block;height:100%;width:0;background:var(--local)}
+    .tag{display:inline-block;margin-left:7px;padding:1px 6px;border-radius:9px;font-size:11px;font-weight:650;background:var(--server-soft);color:var(--server);vertical-align:1px}
+    .crumb{border:0;background:transparent;color:var(--muted);padding:1px 4px;font:inherit;font-weight:500;text-transform:none;letter-spacing:0;border-radius:3px}
+    .crumb:hover{color:var(--ink);background:var(--button-hover)}
+    .crumb.current{color:var(--ink);font-weight:700}
+    .crumb-sep{color:var(--muted);opacity:.45}
     .mini{border:0;background:transparent;color:var(--blue);padding:3px 5px;font-size:13px}
     .mini.stop{color:var(--red)}
     .mini:disabled{color:var(--muted);cursor:not-allowed}
@@ -104,8 +110,7 @@
       .panes{width:100%;padding:0;grid-template-columns:1fr;gap:0}
       .pane{border:0;border-radius:0}
       .pane:not(.active){display:none}
-      .foot-summary{flex:0 0 100%}
-      .pane-foot button{flex:1}
+      .foot-actions button{flex:1}
       .notice{right:10px;left:10px;bottom:96px;max-width:none}
       th:nth-child(2),td:nth-child(2),th:nth-child(3),td:nth-child(3){display:none}
       th:nth-child(1){width:60%}th:nth-child(4){width:40%}
@@ -138,9 +143,12 @@
       <div class="pane-body" id="stagedList"></div>
       <div class="pane-foot">
         <div class="foot-summary" id="stagedSummary">Drop files to get started.</div>
-        <button class="secondary" id="clearDone" type="button">Clear done</button>
-        <button class="danger" id="cancelAll" type="button">Cancel all</button>
-        <button class="primary" id="uploadAll" type="button">Upload</button>
+        <div class="foot-actions">
+          <button class="secondary" id="retryFailed" type="button">Retry failed</button>
+          <button class="secondary" id="clearDone" type="button">Clear done</button>
+          <button class="danger" id="cancelAll" type="button">Cancel all</button>
+          <button class="primary" id="uploadAll" type="button">Upload</button>
+        </div>
       </div>
     </section>
     <section class="pane pane-server" id="paneServer">
@@ -176,7 +184,7 @@
     var chunkSize = 8 * 1024 * 1024;
 
     var files = [], currentPath = '';
-    var staged = [], nextItemId = 1, collapsed = {}, running = false;
+    var staged = [], nextItemId = 1, collapsed = {}, running = false, storageFree = 0;
 
     var fileInput = document.getElementById('fileInput');
     var folderInput = document.getElementById('folderInput');
@@ -262,6 +270,33 @@
       try { return await run(); } finally { release(); }
     }
 
+    function backoff(attempt, signal) {
+      return new Promise(function(resolve, reject) {
+        var timer = setTimeout(resolve, 300 * Math.pow(3, attempt - 1));
+        signal.addEventListener('abort', function() {
+          clearTimeout(timer);
+          reject(new DOMException('Aborted', 'AbortError'));
+        }, { once: true });
+      });
+    }
+
+    // Parts are idempotent server-side, so a transient failure can simply be
+    // re-sent. 4xx responses will not fix themselves and are returned as-is.
+    async function sendWithRetry(run, signal, attempts) {
+      var limit = attempts || 3;
+      for (var attempt = 1; ; attempt++) {
+        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        try {
+          var response = await limited(run);
+          if (response.status >= 500 && attempt < limit) { await backoff(attempt, signal); continue; }
+          return response;
+        } catch (error) {
+          if (signal.aborted || error.name === 'AbortError' || attempt >= limit) throw error;
+          await backoff(attempt, signal);
+        }
+      }
+    }
+
     function groupOf(relativePath) {
       return relativePath.indexOf('/') > 0 ? relativePath.slice(0, relativePath.indexOf('/')) : '';
     }
@@ -299,10 +334,12 @@
       return order.map(function(name){ return { name: name, items: byName[name] } });
     }
 
-    var groupDom = {};
+    var groupDom = {}, conflictSet = {};
     function renderStaged() {
       stagedList.replaceChildren();
       groupDom = {};
+      conflictSet = {};
+      conflicts().forEach(function(name){ conflictSet[name] = true });
       if (!staged.length) {
         var note = document.createElement('div');
         note.className = 'dropnote';
@@ -356,6 +393,12 @@
       row.className = 'item ' + item.status;
       var name = document.createElement('div');
       name.className = 'item-name'; name.textContent = itemLabel(item); name.title = item.relative;
+      if (item.status === 'queued' && conflictSet[item.group || item.relative]) {
+        var tag = document.createElement('span');
+        tag.className = 'tag'; tag.textContent = 'replaces';
+        tag.title = 'Something with this name already exists on the server';
+        name.appendChild(tag);
+      }
       var side = document.createElement('div');
       side.className = 'item-side';
       var size = document.createElement('span');
@@ -370,7 +413,14 @@
         else staged = staged.filter(function(other){ return other !== item });
         renderStaged();
       };
-      side.append(size, status, stop);
+      side.append(size, status);
+      if (item.status === 'failed' || item.status === 'cancelled') {
+        var again = document.createElement('button');
+        again.className = 'mini'; again.type = 'button'; again.textContent = 'Retry';
+        again.onclick = function() { requeue([item]); };
+        side.append(again);
+      }
+      side.append(stop);
       var progress = document.createElement('div');
       progress.className = 'progress';
       var fill = document.createElement('span');
@@ -415,6 +465,54 @@
       });
     }
 
+    var transferRate = 0, rateTime = 0, rateBytes = 0;
+    function resetRate() { transferRate = 0; rateTime = performance.now(); rateBytes = 0; }
+    function sampleRate(sent) {
+      var now = performance.now();
+      var elapsed = (now - rateTime) / 1000;
+      if (elapsed < 0.5) return;
+      var instant = (sent - rateBytes) / elapsed;
+      // Smoothed so the readout does not jitter between parts.
+      transferRate = transferRate ? transferRate * 0.6 + instant * 0.4 : instant;
+      rateTime = now; rateBytes = sent;
+    }
+    function formatDuration(seconds) {
+      if (!isFinite(seconds) || seconds < 0) return '';
+      if (seconds < 60) return Math.max(1, Math.round(seconds)) + 's';
+      var minutes = Math.floor(seconds / 60);
+      if (minutes < 60) return minutes + 'm ' + Math.round(seconds % 60) + 's';
+      return Math.floor(minutes / 60) + 'h ' + (minutes % 60) + 'm';
+    }
+
+    // Names in the current server directory that staged items would land on.
+    function conflicts() {
+      var existing = {};
+      files.forEach(function(file){ existing[file.name] = file.type });
+      var hits = [];
+      staged.forEach(function(item) {
+        if (item.status !== 'queued') return;
+        var top = item.group || item.relative;
+        if (existing[top] && hits.indexOf(top) < 0) hits.push(top);
+      });
+      return hits;
+    }
+
+    function confirmOverwrites() {
+      var hits = conflicts();
+      if (!hits.length) return true;
+      return confirm('Already on the server at /' + currentPath + ':\n\n' + hits.join('\n') +
+        '\n\nUploading replaces files with the same name. Continue?');
+    }
+
+    function confirmCapacity() {
+      if (!storageFree) return true;
+      var needed = 0;
+      staged.forEach(function(item){ if (item.status === 'queued') needed += item.total });
+      if (needed <= storageFree) return true;
+      return confirm('This upload needs ' + formatBytes(needed) + ' but only ' +
+        formatBytes(storageFree) + ' is free. Continue anyway?');
+    }
+
     function updateSummary() {
       var count = staged.length;
       var pending = staged.filter(function(item){ return item.status === 'queued' || item.status === 'uploading' });
@@ -425,14 +523,37 @@
       pending.forEach(function(item){ bytes += item.total; sent += item.uploaded });
       document.getElementById('stagedCount').textContent = count ? count + ' file' + (count === 1 ? '' : 's') : 'nothing queued';
       var parts = [];
-      if (pending.length) parts.push(pending.length + ' pending · ' + formatBytes(sent) + ' / ' + formatBytes(bytes));
+      if (pending.length) {
+        var line = pending.length + ' pending · ' + formatBytes(sent) + ' / ' + formatBytes(bytes);
+        if (running) {
+          sampleRate(sent);
+          if (transferRate > 0) {
+            line += ' · ' + formatBytes(transferRate) + '/s';
+            var left = formatDuration((bytes - sent) / transferRate);
+            if (left) line += ' · ' + left + ' left';
+          }
+        }
+        parts.push(line);
+      }
       if (done) parts.push(done + ' done');
       if (failed) parts.push(failed + ' failed');
       if (cancelled) parts.push(cancelled + ' cancelled');
       document.getElementById('stagedSummary').textContent = parts.length ? parts.join(' · ') : (count ? 'Ready to upload.' : 'Drop files to get started.');
       document.getElementById('uploadAll').disabled = running || !staged.some(function(item){ return item.status === 'queued' });
       document.getElementById('cancelAll').disabled = !pending.length;
+      document.getElementById('retryFailed').disabled = running || !(failed + cancelled);
       document.getElementById('clearDone').disabled = !staged.some(function(item){ return item.status !== 'queued' && item.status !== 'uploading' });
+    }
+
+    // Retries restart the file rather than resuming: the server keeps parts but
+    // exposes no way to ask which ones already landed.
+    function requeue(items) {
+      items.forEach(function(item) {
+        if (item.status !== 'failed' && item.status !== 'cancelled') return;
+        item.status = 'queued'; item.uploaded = 0; item.error = ''; item.sessionId = '';
+      });
+      renderStaged();
+      runQueue();
     }
 
     function cancelItem(item) {
@@ -454,9 +575,9 @@
       var file = item.file;
       try {
         var target = currentPath ? currentPath + '/' + item.relative : item.relative;
-        var started = await limited(function() {
+        var started = await sendWithRetry(function() {
           return fetch('/api/cli/uploads/' + toFileId(target) + '?size=' + file.size + '&partSize=' + chunkSize + '&format=tsv', { method: 'POST', signal });
-        });
+        }, signal);
         if (!started.ok) throw await failure(started, 'Could not start upload');
         var fields = (await started.text()).trim().split('\t');
         item.sessionId = fields[0];
@@ -466,20 +587,20 @@
         await pool(partCount, PART_CONCURRENCY, async function(index) {
           if (signal.aborted) return;
           var from = index * partSize, to = Math.min(from + partSize, file.size);
-          var response = await limited(function() {
+          var response = await sendWithRetry(function() {
             return fetch('/api/cli/uploads/' + item.sessionId + '/parts/' + index, {
               method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' }, body: file.slice(from, to), signal,
             });
-          });
+          }, signal);
           if (!response.ok) throw await failure(response, 'Part ' + index + ' failed');
           item.uploaded = item.uploaded + (to - from);
           scheduleUpdate();
         });
         if (signal.aborted) return;
 
-        var finished = await limited(function() {
+        var finished = await sendWithRetry(function() {
           return fetch('/api/cli/uploads/' + item.sessionId + '/finish', { method: 'POST', signal });
-        });
+        }, signal);
         if (!finished.ok) throw await failure(finished, 'Could not finish upload');
         item.sessionId = '';
         item.uploaded = item.total;
@@ -499,18 +620,32 @@
 
     async function runQueue() {
       if (running) return;
-      var pending = staged.filter(function(item){ return item.status === 'queued' });
-      if (!pending.length) return;
+      if (!staged.some(function(item){ return item.status === 'queued' })) return;
+      if (!confirmOverwrites() || !confirmCapacity()) return;
       running = true;
+      resetRate();
       updateSummary();
-      await pool(pending.length, FILE_CONCURRENCY, async function(index) {
-        var item = pending[index];
-        if (item.status !== 'queued') return;
-        await uploadItem(item);
-      });
+      // Re-checked each pass so items retried mid-run get picked up.
+      var processed = [];
+      while (true) {
+        var pending = staged.filter(function(item){ return item.status === 'queued' });
+        if (!pending.length) break;
+        pending.forEach(function(item){ if (processed.indexOf(item) < 0) processed.push(item); });
+        await pool(pending.length, FILE_CONCURRENCY, async function(index) {
+          var item = pending[index];
+          if (item.status !== 'queued') return;
+          await uploadItem(item);
+        });
+      }
       running = false;
-      var failed = staged.filter(function(item){ return item.status === 'failed' }).length;
-      showNotice(failed ? failed + ' upload' + (failed === 1 ? '' : 's') + ' failed' : 'Upload complete', failed > 0);
+      var done = processed.filter(function(item){ return item.status === 'done' }).length;
+      var failed = processed.filter(function(item){ return item.status === 'failed' }).length;
+      var cancelled = processed.filter(function(item){ return item.status === 'cancelled' }).length;
+      var summary = [];
+      if (done) summary.push(done + ' uploaded');
+      if (cancelled) summary.push(cancelled + ' cancelled');
+      if (failed) summary.push(failed + ' failed');
+      showNotice(summary.join(' · ') || 'Nothing uploaded', failed > 0);
       renderStaged();
       await refresh();
     }
@@ -539,13 +674,38 @@
       });
     }
 
+    function renderBreadcrumbs() {
+      var host = document.getElementById('serverPath');
+      host.replaceChildren();
+      var root = document.createElement('button');
+      root.className = 'crumb'; root.type = 'button'; root.textContent = '/';
+      root.title = 'Go to root';
+      root.onclick = function() { currentPath = ''; refresh(); };
+      host.appendChild(root);
+      var walked = '';
+      var segments = currentPath ? currentPath.split('/') : [];
+      segments.forEach(function(segment, index) {
+        walked = walked ? walked + '/' + segment : segment;
+        var target = walked;
+        var crumb = document.createElement('button');
+        crumb.className = 'crumb' + (index === segments.length - 1 ? ' current' : '');
+        crumb.type = 'button'; crumb.textContent = segment;
+        crumb.onclick = function() { currentPath = target; refresh(); };
+        var separator = document.createElement('span');
+        separator.className = 'crumb-sep'; separator.textContent = '/';
+        host.append(index ? separator : document.createTextNode(''), crumb);
+      });
+    }
+
     async function refresh() {
       try {
         var result = await api('/api/files?path=' + encodeURIComponent(currentPath));
         files = result.files; render();
-        document.getElementById('serverPath').textContent = '/' + currentPath;
+        renderBreadcrumbs();
         document.getElementById('up').disabled = !currentPath;
+        renderStaged();
         var status = await api('/api/status');
+        storageFree = status.free;
         document.getElementById('storage').textContent = formatBytes(status.used) + ' used / ' + formatBytes(status.total) + ' total';
       } catch (error) { showNotice(error.message, true); }
     }
@@ -557,21 +717,48 @@
     document.getElementById('uploadAll').onclick=function(){runQueue()};
     document.getElementById('cancelAll').onclick=function(){staged.forEach(cancelItem);renderStaged()};
     document.getElementById('clearDone').onclick=function(){staged=staged.filter(function(item){return item.status==='queued'||item.status==='uploading'});renderStaged()};
+    document.getElementById('retryFailed').onclick=function(){requeue(staged.filter(function(item){return item.status==='failed'||item.status==='cancelled'}))};
 
     ['dragenter','dragover'].forEach(function(name){paneLocal.addEventListener(name,function(event){event.preventDefault();paneLocal.classList.add('drag')})});
     ['dragleave','drop'].forEach(function(name){paneLocal.addEventListener(name,function(event){event.preventDefault();paneLocal.classList.remove('drag')})});
-    paneLocal.addEventListener('drop',function(event){
-      var items = event.dataTransfer.items;
-      var hasDirectory = false;
-      if (items) {
-        Array.prototype.forEach.call(items, function(entry) {
-          var handle = entry.webkitGetAsEntry && entry.webkitGetAsEntry();
-          if (handle && handle.isDirectory) hasDirectory = true;
+    function readEntries(reader) {
+      return new Promise(function(resolve, reject){ reader.readEntries(resolve, reject) });
+    }
+
+    // Walks a dropped entry tree, tagging each file with the relative path it
+    // should keep on the server. readEntries yields at most 100 at a time.
+    async function walkEntry(entry, prefix, out) {
+      if (entry.isFile) {
+        var file = await new Promise(function(resolve, reject){ entry.file(resolve, reject) });
+        Object.defineProperty(file, 'webkitRelativePath', { value: prefix + entry.name, configurable: true });
+        out.push(file);
+        return;
+      }
+      var reader = entry.createReader();
+      while (true) {
+        var batch = await readEntries(reader);
+        if (!batch.length) break;
+        for (var i = 0; i < batch.length; i++) await walkEntry(batch[i], prefix + entry.name + '/', out);
+      }
+    }
+
+    paneLocal.addEventListener('drop', async function(event) {
+      // Entries must be captured synchronously; dataTransfer empties after this handler.
+      var roots = [];
+      if (event.dataTransfer.items) {
+        Array.prototype.forEach.call(event.dataTransfer.items, function(item) {
+          var entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
+          if (entry) roots.push(entry);
         });
       }
-      var dropped = Array.prototype.filter.call(event.dataTransfer.files, function(file) { return file.size > 0 || file.type });
-      if (dropped.length) addFiles(dropped);
-      if (hasDirectory) showNotice('Dropped folders are not read yet — use Add folder for those', true);
+      if (!roots.length) { addFiles(event.dataTransfer.files); return; }
+      var collected = [];
+      try {
+        for (var i = 0; i < roots.length; i++) await walkEntry(roots[i], '', collected);
+      } catch (error) {
+        showNotice('Could not read dropped folder: ' + error.message, true);
+      }
+      if (collected.length) addFiles(collected);
     });
 
     document.getElementById('up').onclick=function(){currentPath=currentPath.includes('/')?currentPath.slice(0,currentPath.lastIndexOf('/')):'';refresh()};
